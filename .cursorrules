@@ -1,0 +1,6 @@
+- Project: Apna Coach (AI Fitness Companion)
+- Goal: Solve the "static info" problem of GPT/YouTube with proactive conversation.
+- Vibe: Authentic "Bhai/Bro" Hinglish (Mirroring user tone).
+- Stack: FastAPI, Supabase, Meta WhatsApp API.
+- Mandatory: Every major response must be Text + Audio script.
+- Cost Rule: Use JSON pruning between agents. Reference @docs/ for all logic.
