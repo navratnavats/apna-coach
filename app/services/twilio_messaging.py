@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -39,12 +40,20 @@ def _send_whatsapp_message_sync(to_phone_number: str, body: str) -> None:
     request.add_header("Authorization", f"Basic {auth_header}")
     request.add_header("Content-Type", "application/x-www-form-urlencoded")
 
-    with urllib.request.urlopen(request, timeout=20) as response:
-        response_body = response.read().decode("utf-8", errors="ignore")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response_body = response.read().decode("utf-8", errors="ignore")
+            print(
+                f"[Twilio Outbound] Sent message status={response.status} "
+                f"response_chars={len(response_body)}"
+            )
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
         print(
-            f"[Twilio Outbound] Sent message status={response.status} "
-            f"response_chars={len(response_body)}"
+            f"[Twilio Outbound Error] status={exc.code} reason={exc.reason} "
+            f"body={error_body}"
         )
+        raise
 
 
 async def send_whatsapp_message(to_phone_number: str, body: str) -> None:

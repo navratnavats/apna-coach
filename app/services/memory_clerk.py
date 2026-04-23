@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
-from app.config import GEMINI_API_KEY, GEMINI_MODEL_3_1_FLASH
+from app.config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL_3_1_FLASH,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+)
 
 
 def load_default_living_profile() -> dict[str, Any]:
@@ -95,6 +102,76 @@ async def ai_memory_clerk(user_message: str, current_profile: dict[str, Any]) ->
         print(f"[AI] Response received in {elapsed_ms} ms (chars={len(response_text)})")
         parsed = extract_json_from_model_text(response_text)
         print(f"[AI] Parsed update keys: {sorted(parsed.keys())}")
+        return parsed
+
+    return await asyncio.to_thread(_call_model)
+
+
+def _download_image_bytes(image_url: str) -> bytes:
+    request = urllib.request.Request(image_url, method="GET")
+    # Twilio media URLs may require account auth.
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        credentials = f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")
+        auth_header = base64.b64encode(credentials).decode("ascii")
+        request.add_header("Authorization", f"Basic {auth_header}")
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read()
+
+
+async def ai_nutrition_from_image(
+    image_url: str, current_profile: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Brain A vision extension:
+    Estimate meal nutrition from image and return a normalized food log object.
+    """
+    if not GEMINI_API_KEY:
+        print("[AI Vision] GEMINI_API_KEY missing; skipping image nutrition extraction.")
+        return {}
+
+    system_prompt = (
+        "You are the Memory Clerk for Apna Coach. Analyze the food image and return "
+        "ONLY a JSON object with estimated nutrition details.\n\n"
+        "Return format:\n"
+        "{\n"
+        '  "food_log_entry": {\n'
+        '    "source": "image",\n'
+        '    "summary": "short description of meal",\n'
+        '    "estimated_calories": number,\n'
+        '    "estimated_macros": {"protein_g": number, "carbs_g": number, "fat_g": number},\n'
+        '    "confidence": "low|medium|high"\n'
+        "  }\n"
+        "}\n"
+        "Do not output markdown. Do not include any extra text."
+    )
+
+    def _call_model() -> dict[str, Any]:
+        started_at = time.perf_counter()
+        print(f"[AI Vision] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
+        image_bytes = _download_image_bytes(image_url)
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL_3_1_FLASH,
+            system_instruction=system_prompt,
+        )
+        response = model.generate_content(
+            [
+                {
+                    "mime_type": "image/jpeg",
+                    "data": image_bytes,
+                },
+                json.dumps({"current_profile": current_profile}, ensure_ascii=False),
+            ],
+            generation_config={"response_mime_type": "application/json"},
+        )
+        response_text = response.text or "{}"
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        print(
+            f"[AI Vision] Response received in {elapsed_ms} ms "
+            f"(chars={len(response_text)})"
+        )
+        parsed = extract_json_from_model_text(response_text)
+        print(f"[AI Vision] Parsed keys: {sorted(parsed.keys())}")
         return parsed
 
     return await asyncio.to_thread(_call_model)

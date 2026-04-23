@@ -45,7 +45,11 @@ def _sanitize_coach_reply(reply_text: str) -> str:
     )
 
 
-async def generate_coach_reply(user_message: str, living_profile: dict[str, Any]) -> str:
+async def generate_coach_reply(
+    user_message: str,
+    living_profile: dict[str, Any],
+    session_context: dict[str, Any] | None = None,
+) -> str:
     """
     Brain B (Coach):
     Generate an empathetic, concise coaching reply using fresh profile context.
@@ -77,12 +81,15 @@ async def generate_coach_reply(user_message: str, living_profile: dict[str, Any]
         "JSON context before answering. Reference their goals, respect their injuries, "
         "and ask one guiding question at the end to keep them engaged. Do not output "
         "markdown, just clean text.\n\n"
+        "If session_context.nutrition_logged_this_turn is true, acknowledge that food "
+        "has been logged before giving coaching advice.\n"
         + "\n".join(additional_rules)
     )
 
     model_input = {
         "living_profile": living_profile,
         "user_message": user_message,
+        "session_context": session_context or {},
     }
 
     def _call_model() -> str:

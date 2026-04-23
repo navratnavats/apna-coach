@@ -35,3 +35,11 @@ TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM: str = os.getenv("TWILIO_WHATSAPP_FROM", "")
 
+# Proactive engine (scheduler) settings.
+SCHEDULER_ENABLED: bool = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+CHECKIN_INTERVAL_MINUTES: int = int(os.getenv("CHECKIN_INTERVAL_MINUTES", "360"))
+CHECKIN_MESSAGE: str = os.getenv(
+    "CHECKIN_MESSAGE",
+    "Bhai, this is an automated check-in. Have you worked out today?",
+)
+
