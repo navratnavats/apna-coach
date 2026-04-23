@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project allowlist for safe placeholders"
+paths = [
+  '''(^|/)docs/''',
+]
+
+regexes = [
+  '''your-[a-z0-9\-_]+-here''',
+  '''example|placeholder|sample''',
+]
+
