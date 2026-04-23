@@ -25,7 +25,7 @@ RECENT_EVENT_TTL_SECONDS = 45
 _recent_twilio_events: dict[str, float] = {}
 _phone_locks: dict[str, asyncio.Lock] = {}
 AI_STAGE_TIMEOUT_SECONDS = 25
-TOTAL_PIPELINE_TIMEOUT_SECONDS = 45
+TOTAL_PIPELINE_TIMEOUT_SECONDS = 600
 OUTBOUND_STATUS_VALUES = {"sent", "delivered", "read", "failed", "undelivered"}
 
 
