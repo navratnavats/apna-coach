@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -18,7 +21,7 @@ from app.config import (
     TWILIO_WHATSAPP_FROM,
     WHATSAPP_VERIFY_TOKEN,
 )
-from app.services.agent_trace import log_agent_event
+from app.services.agent_trace import log_agent_event, reset_trace_context, set_trace_context
 from app.services.bio_math_agent import (
     calculate_activity_burn,
     compute_current_day_metrics,
@@ -145,6 +148,8 @@ async def _flush_batch_after_window(phone_number: str) -> None:
     _batch_flush_tasks.pop(phone_number, None)
     if not batch:
         return
+    if not batch.get("turn_id"):
+        batch["turn_id"] = f"turn-{uuid4().hex[:16]}"
     queue = _phone_queues.setdefault(phone_number, deque())
     queue.append(batch)
     if phone_number not in _phone_worker_tasks or _phone_worker_tasks[phone_number].done():
@@ -157,14 +162,17 @@ def _enqueue_into_batch(
     incoming_text: str,
     media_items: list[dict[str, str]],
     trace_id: str,
+    event_id: str,
 ) -> None:
     batch = _pending_batches.get(phone_number)
     if not batch:
         batch = {
             "phone_number": phone_number,
+            "turn_id": f"turn-{uuid4().hex[:16]}",
             "texts": [],
             "media_items": [],
             "trace_ids": [],
+            "source_event_ids": [],
             "created_at": time.time(),
         }
         _pending_batches[phone_number] = batch
@@ -174,6 +182,8 @@ def _enqueue_into_batch(
     if media_items:
         batch["media_items"].extend(media_items)
     batch["trace_ids"].append(trace_id)
+    if event_id:
+        batch["source_event_ids"].append(event_id)
     batch["last_event_at"] = time.time()
 
     existing_task = _batch_flush_tasks.get(phone_number)
@@ -190,12 +200,16 @@ async def _run_phone_queue_worker(phone_number: str) -> None:
         combined_text = "\n".join(texts).strip()
         media_items = batch.get("media_items") or []
         trace_ids = batch.get("trace_ids") or []
+        source_event_ids = batch.get("source_event_ids") or []
+        turn_id = str(batch.get("turn_id") or f"turn-{uuid4().hex[:16]}")
         trace_id = trace_ids[0] if trace_ids else f"{phone_number}-{int(time.time() * 1000)}"
         await _process_and_send_twilio_reply(
             phone_number,
             combined_text,
             media_items=media_items,
             trace_id=trace_id,
+            turn_id=turn_id,
+            source_event_ids=source_event_ids,
         )
 
 
@@ -204,12 +218,19 @@ async def _process_and_send_twilio_reply(
     body: str,
     media_items: list[dict[str, str]] | None = None,
     trace_id: str | None = None,
+    turn_id: str | None = None,
+    source_event_ids: list[str] | None = None,
 ) -> None:
     request_started_at = time.perf_counter()
     reply_message = "Give me a second, optimizing your plan..."
     quota_warning_suffix = ""
     phone_lock = _phone_locks.setdefault(phone_number, asyncio.Lock())
     media_items = media_items or []
+    source_event_ids = source_event_ids or []
+    if not turn_id:
+        turn_id = f"turn-{uuid4().hex[:16]}"
+    # For pipeline correlation, prefer turn-level trace id.
+    trace_id = turn_id
 
     async def _run_pipeline() -> None:
         nonlocal reply_message, quota_warning_suffix
@@ -217,10 +238,12 @@ async def _process_and_send_twilio_reply(
             agent="front_desk",
             stage="pipeline_start",
             trace_id=trace_id,
+            turn_id=turn_id,
             details={
                 "phone_number": phone_number,
                 "has_media": bool(media_items),
                 "media_count": len(media_items),
+                "source_event_ids": source_event_ids,
             },
         )
         quota_result = consume_daily_turn_quota(
@@ -255,7 +278,6 @@ async def _process_and_send_twilio_reply(
             .execute()
         )
         existing_rows = existing_user_resp.data or []
-        print(f"[Twilio Flow] Existing user found: {bool(existing_rows)}")
 
         base_profile: dict[str, Any]
         onboarding_was_complete = False
@@ -306,7 +328,6 @@ async def _process_and_send_twilio_reply(
                 if not effective_user_text
                 else f"{effective_user_text}\n\nVoice note transcript: {merged_transcript}"
             )
-            print("[Twilio Flow] Voice note transcribed and added to user context.")
 
         policy_result = await classify_query_policy(
             user_message=effective_user_text,
@@ -402,10 +423,6 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
             )
         memory_elapsed_ms = int((time.perf_counter() - memory_started_at) * 1000)
-        print(f"[Twilio Timing] Memory clerk completed in {memory_elapsed_ms} ms")
-        print(
-            f"[Twilio Flow] Extracted updates: {json.dumps(extracted_updates, ensure_ascii=False)}"
-        )
         extracted_logs = extracted_updates.get("logs")
         extracted_nutrition_entries: list[dict[str, Any]] = []
         extracted_workout_summaries: list[dict[str, Any]] = []
@@ -507,10 +524,6 @@ async def _process_and_send_twilio_reply(
             logs["nutrition_log"] = nutrition_log
             merged_profile["logs"] = logs
             nutrition_logged_this_turn = True
-            print(
-                f"[Twilio Flow] Nutrition entries appended from {source_hint}: "
-                f"{len(extracted_nutrition_entries)}"
-            )
 
         if has_image_media:
             rejected_non_fitness_images = 0
@@ -555,7 +568,7 @@ async def _process_and_send_twilio_reply(
                     )
                     return
             if nutrition_logged_this_turn:
-                print("[Twilio Flow] Nutrition entries appended from image(s).")
+                pass
 
         if (
             extracted_workout_complete is True
@@ -769,7 +782,6 @@ async def _process_and_send_twilio_reply(
             .eq("phone_number", phone_number)
             .execute()
         )
-        print("[Twilio Flow] Living profile update saved to Supabase.")
         log_agent_event(
             agent="memory_clerk",
             stage="profile_saved",
@@ -932,7 +944,6 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
             )
             coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
-            print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
             if coach_reply.strip():
                 reply_message = coach_reply.strip()
                 if routed_intent in {"plan_create_request", "plan_edit_request"}:
@@ -1013,6 +1024,11 @@ async def _process_and_send_twilio_reply(
                 print(f"[Twilio Delay Ping Error] {exc}")
 
     ping_task = asyncio.create_task(_send_delay_pings())
+    trace_context_token = set_trace_context(
+        trace_id=trace_id,
+        turn_id=turn_id,
+        phone_number=phone_number,
+    )
 
     try:
         async with phone_lock:
@@ -1030,11 +1046,11 @@ async def _process_and_send_twilio_reply(
             pipeline_busy_retry()
         )
     finally:
+        reset_trace_context(trace_context_token)
         done_event.set()
         if not ping_task.done():
             ping_task.cancel()
         total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
-        print(f"[Twilio Timing] Total async processing time: {total_elapsed_ms} ms")
 
     if quota_warning_suffix and "trial limit" not in reply_message.lower():
         reply_message = f"{reply_message}{quota_warning_suffix}"
@@ -1063,6 +1079,118 @@ async def health() -> dict[str, str]:
     return {"status": "bhai_is_alive"}
 
 
+@router.get("/debug/traces")
+async def debug_traces(
+    phone: Optional[str] = Query(default=None),
+    turn_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> JSONResponse:
+    query = (
+        supabase.table("agent_trace_events")
+        .select("ts,trace_id,turn_id,phone_number,agent,stage,status,details,created_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if phone:
+        query = query.eq("phone_number", phone.strip())
+    if turn_id:
+        query = query.eq("turn_id", turn_id.strip())
+    result = query.execute()
+    return JSONResponse(content={"items": result.data or []})
+
+
+@router.get("/debug/trace/{trace_id}")
+async def debug_trace_by_id(
+    trace_id: str,
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> JSONResponse:
+    result = (
+        supabase.table("agent_trace_events")
+        .select("ts,trace_id,turn_id,phone_number,agent,stage,status,details,created_at")
+        .eq("trace_id", trace_id.strip())
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return JSONResponse(content={"trace_id": trace_id, "items": result.data or []})
+
+
+@router.get("/debug/turn/{turn_id}")
+async def debug_trace_by_turn_id(
+    turn_id: str,
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> JSONResponse:
+    result = (
+        supabase.table("agent_trace_events")
+        .select("ts,trace_id,turn_id,phone_number,agent,stage,status,details,created_at")
+        .eq("turn_id", turn_id.strip())
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return JSONResponse(content={"turn_id": turn_id, "items": result.data or []})
+
+
+@router.get("/debug/traces/export.csv")
+async def debug_traces_export_csv(
+    phone: Optional[str] = Query(default=None),
+    trace_id: Optional[str] = Query(default=None),
+    turn_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=5000, ge=1, le=20000),
+) -> Response:
+    query = (
+        supabase.table("agent_trace_events")
+        .select("ts,trace_id,turn_id,phone_number,agent,stage,status,details,created_at")
+        .order("created_at", desc=False)
+        .limit(limit)
+    )
+    if phone:
+        query = query.eq("phone_number", phone.strip())
+    if trace_id:
+        query = query.eq("trace_id", trace_id.strip())
+    if turn_id:
+        query = query.eq("turn_id", turn_id.strip())
+    result = query.execute()
+    rows = result.data or []
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "ts",
+            "trace_id",
+            "turn_id",
+            "phone_number",
+            "agent",
+            "stage",
+            "status",
+            "details",
+            "created_at",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("ts"),
+                row.get("trace_id"),
+                row.get("turn_id"),
+                row.get("phone_number"),
+                row.get("agent"),
+                row.get("stage"),
+                row.get("status"),
+                json.dumps(row.get("details") or {}, ensure_ascii=False),
+                row.get("created_at"),
+            ]
+        )
+    csv_data = output.getvalue()
+    output.close()
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=agent_traces.csv"},
+    )
+
+
 @router.get("/webhook")
 async def verify_whatsapp_webhook(
     hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
@@ -1087,8 +1215,6 @@ async def verify_whatsapp_webhook(
 @router.post("/webhook")
 async def receive_whatsapp_webhook(request: Request) -> JSONResponse:
     payload: Any = await request.json()
-    print("Incoming WhatsApp webhook payload:")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return JSONResponse(content={"status": "ok"})
 
 
@@ -1113,13 +1239,6 @@ async def receive_twilio_webhook(
     phone_number = From.removeprefix("whatsapp:").strip()
     incoming_text = (Body or "").strip()
     trace_id = (MessageSid or "").strip() or f"{phone_number}-{int(time.time() * 1000)}"
-    log_agent_event(
-        agent="front_desk",
-        stage="incoming_event",
-        trace_id=trace_id,
-        details={"has_text": bool(incoming_text), "num_media": NumMedia or "0"},
-    )
-    print(f"[Twilio Incoming] {phone_number} says: {incoming_text}")
     media_count = 0
     try:
         media_count = int(NumMedia or "0")
@@ -1133,7 +1252,7 @@ async def receive_twilio_webhook(
         if url:
             media_items.append({"url": url, "content_type": ctype})
     if media_items:
-        print(f"[Twilio Incoming] Media detected for {phone_number}. count={len(media_items)}")
+        pass
 
     # Guard 1: status callbacks are not user chat messages.
     # IMPORTANT: inbound user events may carry SmsStatus=received, so do not drop
@@ -1142,10 +1261,6 @@ async def receive_twilio_webhook(
     has_user_content = bool(incoming_text) or len(media_items) > 0
     is_outbound_status_callback = callback_status in OUTBOUND_STATUS_VALUES
     if is_outbound_status_callback and not has_user_content:
-        print(
-            f"[Twilio Event] type=status_callback from={phone_number} "
-            f"status={callback_status}"
-        )
         return Response(
             content=_safe_twiml_message("Status callback received."),
             media_type="application/xml",
@@ -1153,7 +1268,6 @@ async def receive_twilio_webhook(
 
     # Guard 2: ignore empty non-content events.
     if not incoming_text and len(media_items) == 0:
-        print(f"[Twilio Event] type=empty_filtered from={phone_number}")
         return Response(
             content=_safe_twiml_message("No message content received."),
             media_type="application/xml",
@@ -1162,14 +1276,12 @@ async def receive_twilio_webhook(
     # Guard 3: ignore sandbox-origin system echoes/events.
     sandbox_source = TWILIO_WHATSAPP_FROM.removeprefix("whatsapp:").strip()
     if sandbox_source and phone_number == sandbox_source and not incoming_text and len(media_items) == 0:
-        print(f"[Twilio Event] type=sandbox_filtered from={phone_number}")
         return Response(
             content=_safe_twiml_message("Sandbox event ignored."),
             media_type="application/xml",
         )
 
     if not _try_record_message_sid(MessageSid or "", phone_number):
-        print(f"[Twilio Event] type=duplicate_message_sid from={phone_number}")
         return Response(
             content=_safe_twiml_message("Duplicate event skipped."),
             media_type="application/xml",
@@ -1185,26 +1297,32 @@ async def receive_twilio_webhook(
         f"{phone_number}|{incoming_text}|{event_media_sig}|{MessageSid or ''}"
     )
     if event_key in _recent_twilio_events:
-        print(f"[Twilio Event] type=duplicate from={phone_number}")
         return Response(
             content=_safe_twiml_message("Duplicate event skipped."),
             media_type="application/xml",
         )
     _recent_twilio_events[event_key] = now_ts
-    print(
-        f"[Twilio Event] type=real_user from={phone_number} "
-        f"has_text={bool(incoming_text)} media_count={len(media_items)}"
-    )
 
     _enqueue_into_batch(
         phone_number=phone_number,
         incoming_text=incoming_text,
         media_items=media_items,
         trace_id=trace_id,
+        event_id=(MessageSid or "").strip(),
     )
-    print(
-        f"[Twilio Batch] Event added for {phone_number}. "
-        f"buffer_window_seconds={BATCH_WINDOW_SECONDS}"
+    batch_turn_id = str((_pending_batches.get(phone_number) or {}).get("turn_id") or "")
+    log_agent_event(
+        agent="front_desk",
+        stage="incoming_event",
+        trace_id=trace_id,
+        turn_id=batch_turn_id or None,
+        phone_number=phone_number,
+        details={
+            "has_text": bool(incoming_text),
+            "num_media": NumMedia or "0",
+            "message_sid": (MessageSid or "").strip(),
+            "accepted": True,
+        },
     )
 
     has_audio = any(
