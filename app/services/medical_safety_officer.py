@@ -10,6 +10,7 @@ import google.generativeai as genai
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
+from app.services.persona import resolve_user_address
 
 
 def _extract_injuries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
@@ -47,7 +48,12 @@ def _has_mobility_risk(injuries: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _rule_based_rewrite(workout_text: str, injuries: list[dict[str, Any]]) -> str:
+def _rule_based_rewrite(
+    workout_text: str,
+    injuries: list[dict[str, Any]],
+    *,
+    address: str,
+) -> str:
     if not workout_text.strip():
         return workout_text
     if not _has_mobility_risk(injuries):
@@ -74,7 +80,7 @@ def _rule_based_rewrite(workout_text: str, injuries: list[dict[str, Any]]) -> st
         return safe_text
 
     return (
-        "Bhai, safety check done. Maine kuch high-impact moves swap kiye to protect "
+        f"{address}, safety check done. Maine kuch high-impact moves swap kiye to protect "
         "your lower back/knees based on your injury profile.\n\n"
         f"{safe_text}"
     )
@@ -92,6 +98,7 @@ async def run_medical_safety_officer(
     Intercepts workout output and rewrites unsafe movements before user delivery.
     """
     injuries = _extract_injuries(living_profile)
+    address = resolve_user_address(living_profile)
     log_agent_event(
         agent="medical_safety_officer",
         stage="start",
@@ -108,7 +115,7 @@ async def run_medical_safety_officer(
         return workout_text
 
     if not GEMINI_API_KEY:
-        rewritten = _rule_based_rewrite(workout_text, injuries)
+        rewritten = _rule_based_rewrite(workout_text, injuries, address=address)
         log_agent_event(
             agent="medical_safety_officer",
             stage="complete",
@@ -125,7 +132,7 @@ async def run_medical_safety_officer(
         "Rules:\n"
         "- If workout is safe for these injuries, return the original workout unchanged.\n"
         "- If any movement is risky, rewrite only the risky parts with low-impact alternatives.\n"
-        "- Keep the same concise WhatsApp format and Bhai tone.\n"
+        f"- Keep the same concise WhatsApp format and use address token '{address}'.\n"
         "- If you swap something, explicitly mention why (injury protection).\n"
         "- Do not add markdown.\n"
         "- Output plain text only."
@@ -169,7 +176,7 @@ async def run_medical_safety_officer(
             details={"error": str(exc)},
         )
 
-    rewritten = _rule_based_rewrite(workout_text, injuries)
+    rewritten = _rule_based_rewrite(workout_text, injuries, address=address)
     log_agent_event(
         agent="medical_safety_officer",
         stage="complete",

@@ -193,6 +193,70 @@ def calculate_net_deficit(*, tdee_cals: float, active_cals_burnt: float, food_ca
     return _safe_int(round((tdee_cals + active_cals_burnt) - food_cals))
 
 
+def _is_same_utc_day(iso_ts: str, now_utc: datetime) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).date() == now_utc.date()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sum_today_nutrition_cals(logs: dict[str, Any]) -> int:
+    nutrition_log = logs.get("nutrition_log") or []
+    if not isinstance(nutrition_log, list):
+        return 0
+    now_utc = datetime.now(timezone.utc)
+    total = 0.0
+    for entry in nutrition_log:
+        if not isinstance(entry, dict):
+            continue
+        logged_at = str(entry.get("logged_at") or "").strip()
+        if logged_at and not _is_same_utc_day(logged_at, now_utc):
+            continue
+        total += _safe_float(entry.get("estimated_calories"))
+    return _safe_int(round(total))
+
+
+def compute_current_day_metrics(living_profile: dict[str, Any]) -> dict[str, Any]:
+    """
+    Single source of truth for daily dashboard numbers.
+
+    This computes both:
+    - net_deficit against maintenance burn (TDEE + active - intake)
+    - vs_budget against planned intake target (budget - intake)
+    """
+    logs = living_profile.get("logs") or {}
+    current_day = logs.get("current_day") or {}
+    if not isinstance(current_day, dict):
+        current_day = {}
+    physiology = living_profile.get("physiology") or {}
+    biometrics = physiology.get("biometrics") or {}
+    daily_targets = biometrics.get("daily_targets") or {}
+
+    intake_cals = _sum_today_nutrition_cals(logs)
+    active_cals_burnt = _safe_int(current_day.get("active_cals_burnt"))
+    tdee_cals = _safe_int(daily_targets.get("tdee_cals"))
+    calorie_budget_cals = _safe_int(daily_targets.get("cals") or current_day.get("calorie_budget"))
+    net_deficit_cals = calculate_net_deficit(
+        tdee_cals=tdee_cals,
+        active_cals_burnt=active_cals_burnt,
+        food_cals=intake_cals,
+    )
+    vs_budget_cals = _safe_int(round(calorie_budget_cals - intake_cals))
+
+    return {
+        "intake_cals": intake_cals,
+        "active_cals_burnt": active_cals_burnt,
+        "tdee_cals": tdee_cals,
+        "net_deficit_cals": net_deficit_cals,
+        "calorie_budget_cals": calorie_budget_cals,
+        "vs_budget_cals": vs_budget_cals,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def compute_daily_targets_if_ready(
     living_profile: dict[str, Any],
     trace_id: str | None = None,

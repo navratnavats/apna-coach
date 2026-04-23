@@ -10,7 +10,14 @@ from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
 from app.services.critic_agent import run_critic_agent
+from app.services.messages import (
+    morning_default_plan,
+    morning_missing_equipment,
+    morning_quick_hit_llm_error,
+    morning_quick_hit_no_llm,
+)
 from app.services.medical_safety_officer import run_medical_safety_officer
+from app.services.persona import resolve_user_address
 
 
 def _available_equipment(living_profile: dict[str, Any]) -> list[str]:
@@ -28,6 +35,7 @@ async def generate_morning_workout_nudge(
     Morning proactive Workout Programmer specialist output.
     """
     equipment = _available_equipment(living_profile)
+    address = resolve_user_address(living_profile)
     log_agent_event(
         agent="workout_programmer",
         stage="morning_start",
@@ -36,21 +44,17 @@ async def generate_morning_workout_nudge(
     )
     if not equipment:
         return await run_critic_agent(
-            (
-            "Subah ho gayi Bhai! Plan banane ko ready hoon, but pehle bata tu kis "
-            "setup pe hai - gym access hai ya ghar pe dumbbells/bands/pull-up bar?"
-            ),
+            morning_missing_equipment(address),
             source="morning_nudge",
+            living_profile=living_profile,
             trace_id=trace_id,
         )
 
     if not GEMINI_API_KEY:
         return await run_critic_agent(
-            (
-            "Subah ho gayi Bhai! Aaj 15-min quick hit: 1) Goblet Squat 3x12, "
-            "2) Dumbbell Row 3x12/side, 3) Band Face Pull 3x15. Dhyaan se form pe focus kar."
-            ),
+            morning_quick_hit_no_llm(address),
             source="morning_nudge",
+            living_profile=living_profile,
             trace_id=trace_id,
         )
 
@@ -63,7 +67,7 @@ async def generate_morning_workout_nudge(
         "- Output exactly a 15-minute plan with 3 specific exercises + sets/reps.\n"
         "- Mention target body part for today.\n"
         "- Include one short injury-safe caution if needed.\n"
-        "- Keep message concise, WhatsApp-friendly, Bhai tone.\n"
+        f"- Keep message concise, WhatsApp-friendly, and use address token '{address}'.\n"
         "- Plain text only."
     )
 
@@ -82,15 +86,9 @@ async def generate_morning_workout_nudge(
         text = await asyncio.to_thread(_call_model)
     except Exception as exc:  # noqa: BLE001
         print(f"[Morning Programmer] LLM generation failed: {exc}")
-        text = (
-            "Subah ho gayi Bhai! Aaj 15-min quick hit: 1) DB Romanian Deadlift 3x10, "
-            "2) Resistance Band Row 3x12, 3) Glute Bridge 3x15. Injury-safe pace me kar."
-        )
+        text = morning_quick_hit_llm_error(address)
 
-    final_text = text or (
-        "Subah ho gayi Bhai! Aaj 15-min plan ready: 3 exercises, controlled reps, "
-        "aur form pe full focus."
-    )
+    final_text = text or morning_default_plan(address)
     safety_reviewed = await run_medical_safety_officer(
         final_text,
         living_profile,
@@ -100,6 +98,7 @@ async def generate_morning_workout_nudge(
     final = await run_critic_agent(
         safety_reviewed,
         source="morning_nudge",
+        living_profile=living_profile,
         trace_id=trace_id,
     )
     log_agent_event(

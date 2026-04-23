@@ -12,9 +12,15 @@ from app.services.agent_trace import log_agent_event
 
 ALLOWED_INTENTS = {
     "burn_query",
+    "metric_explanation_query",
     "workout_request",
+    "plan_create_request",
+    "plan_status_query",
+    "plan_edit_request",
+    "plan_change_signal",
     "nutrition_log",
     "activity_log",
+    "historical_query",
     "profile_update",
     "general_chat",
 }
@@ -22,6 +28,30 @@ ALLOWED_INTENTS = {
 
 def _fallback_intent(user_message: str) -> str:
     text = str(user_message or "").lower()
+    if any(
+        k in text
+        for k in (
+            "kya matlab",
+            "what does",
+            "mean",
+            "matlab",
+            "safe hai",
+            "is this safe",
+            "net deficit",
+            "deficit 1135",
+        )
+    ):
+        return "metric_explanation_query"
+    if any(k in text for k in ("what did i eat", "kya khaya", "on tuesday", "history", "kal kya khaya")):
+        return "historical_query"
+    if any(k in text for k in ("12 week", "8 week", "diet plan", "meal plan", "tomorrow plan")):
+        return "plan_create_request"
+    if any(k in text for k in ("edit plan", "modify plan", "adjust plan", "change plan")):
+        return "plan_edit_request"
+    if any(k in text for k in ("vacation", "travel", "trip", "missed today", "skip today")):
+        return "plan_change_signal"
+    if any(k in text for k in ("next week plan", "this week plan", "what next")):
+        return "plan_status_query"
     if any(k in text for k in ("burn", "burnt", "deficit", "kcal", "calorie")):
         return "burn_query"
     if any(k in text for k in ("workout", "exercise", "training", "plan")):
@@ -64,12 +94,18 @@ async def classify_router_intent(
         "You are Agent 2 Router for Apna Coach. Classify the message intent.\n"
         "Return ONLY JSON: {\"primary_intent\":\"...\",\"confidence\":\"high|medium|low\"}.\n"
         "Allowed primary_intent values exactly: "
-        "burn_query, workout_request, nutrition_log, activity_log, profile_update, general_chat.\n"
+        "burn_query, metric_explanation_query, workout_request, plan_create_request, plan_status_query, plan_edit_request, plan_change_signal, nutrition_log, activity_log, historical_query, profile_update, general_chat.\n"
         "Rules:\n"
         "- burn_query: asking burned calories/deficit/intake metrics.\n"
+        "- metric_explanation_query: asking meaning/interpretation/safety of a metric (e.g. net deficit value).\n"
         "- workout_request: asks for workout plan/exercise prescription.\n"
+        "- plan_create_request: asks for multi-day/week/month diet/workout plan.\n"
+        "- plan_status_query: asks what current plan says for tomorrow/this week/next.\n"
+        "- plan_edit_request: explicitly asks to edit or adjust existing plan.\n"
+        "- plan_change_signal: life event impacting plan (vacation, missed day, travel, injury flare).\n"
         "- nutrition_log: user logs food intake.\n"
         "- activity_log: user logs physical activity done.\n"
+        "- historical_query: asks what was eaten/done on past day/date.\n"
         "- profile_update: user updates age/height/gender/weight/equipment/etc.\n"
         "- general_chat: everything else."
     )

@@ -3,18 +3,25 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from app.clients.supabase_client import supabase
-from app.config import TWILIO_WHATSAPP_FROM, WHATSAPP_VERIFY_TOKEN
+from app.config import (
+    SCHEDULER_TIMEZONE,
+    TRIAL_DAILY_TURN_LIMIT,
+    TRIAL_DAILY_TURN_WARNING_THRESHOLD,
+    TWILIO_WHATSAPP_FROM,
+    WHATSAPP_VERIFY_TOKEN,
+)
 from app.services.agent_trace import log_agent_event
 from app.services.bio_math_agent import (
     calculate_activity_burn,
-    calculate_net_deficit,
+    compute_current_day_metrics,
     compute_daily_targets_if_ready,
     normalize_activity_for_burn,
 )
@@ -25,17 +32,58 @@ from app.services.memory_clerk import (
     ai_transcribe_voice_note,
     deep_merge_profile,
     load_default_living_profile,
-    next_onboarding_prompt,
+)
+from app.services.messages import (
+    ack_audio,
+    ack_default,
+    ack_image,
+    ack_long_text,
+    image_rejection,
+    onboarding_missing_biometrics,
+    pipeline_busy_retry,
+    policy_out_of_scope,
+    trial_limit_wall,
+    trial_limit_warning,
+)
+from app.services.intake_agent import (
+    build_graduation_message,
+    build_intake_prompt,
+    get_missing_onboarding_fields,
 )
 from app.services.intent_router import classify_router_intent
+from app.services.critic_agent import run_critic_agent
+from app.services.plan_agent import generate_structured_plan
+from app.services.plan_orchestrator import (
+    PLAN_INTENTS,
+    apply_plan_confirmation_if_any,
+    build_plan_compact_for_prompt,
+    classify_plan_intent_fallback,
+    ensure_plan_state,
+    fetch_latest_plan_version,
+    infer_plan_type_and_horizon,
+    persist_plan_version,
+    upsert_pending_change_request,
+)
+from app.services.policy_agent import classify_query_policy
+from app.services.psychology_agent import (
+    analyze_psychology_signals,
+    apply_psychology_update,
+)
+from app.services.historical_archive import fetch_historical_day, resolve_target_date
 from app.services.profile_schema_guard import sanitize_memory_updates
 from app.services.twilio_messaging import send_whatsapp_message
+from app.services.usage_quota import consume_daily_turn_quota
 
 router = APIRouter()
 RECENT_EVENT_TTL_SECONDS = 45
 _recent_twilio_events: dict[str, float] = {}
 _phone_locks: dict[str, asyncio.Lock] = {}
 OUTBOUND_STATUS_VALUES = {"sent", "delivered", "read", "failed", "undelivered"}
+BATCH_WINDOW_SECONDS = 10.0
+_pending_batches: dict[str, dict[str, Any]] = {}
+_batch_flush_tasks: dict[str, asyncio.Task] = {}
+_phone_queues: dict[str, deque[dict[str, Any]]] = {}
+_phone_worker_tasks: dict[str, asyncio.Task] = {}
 
 
 def _safe_twiml_message(text: str) -> str:
@@ -55,63 +103,150 @@ def _cleanup_recent_events(now_ts: float) -> None:
         _recent_twilio_events.pop(key, None)
 
 
-def _is_same_utc_day(iso_ts: str, now_utc: datetime) -> bool:
+def _try_record_message_sid(message_sid: str, phone_number: str) -> bool:
+    sid = (message_sid or "").strip()
+    if not sid:
+        return True
     try:
-        parsed = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        parsed_utc = parsed.astimezone(timezone.utc)
-        return parsed_utc.date() == now_utc.date()
-    except Exception:  # noqa: BLE001
-        return False
+        (
+            supabase.table("processed_webhook_events")
+            .insert(
+                {
+                    "message_sid": sid,
+                    "phone_number": phone_number,
+                    "payload_type": "twilio_inbound",
+                }
+            )
+            .execute()
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc).lower()
+        if "duplicate key" in text or "unique constraint" in text:
+            return False
+        raise
 
 
-def _recalculate_current_day_calories(logs: dict[str, Any]) -> int:
-    nutrition_log = logs.get("nutrition_log") or []
-    if not isinstance(nutrition_log, list):
-        return 0
+def _contextual_ack_message(
+    *, has_audio: bool, has_image: bool, user_text: str
+) -> str:
+    if has_audio:
+        return ack_audio()
+    if has_image:
+        return ack_image()
+    if len((user_text or "").strip()) > 120:
+        return ack_long_text()
+    return ack_default()
 
-    now_utc = datetime.now(timezone.utc)
-    total = 0.0
-    for entry in nutrition_log:
-        if not isinstance(entry, dict):
-            continue
 
-        logged_at = str(entry.get("logged_at") or "").strip()
-        if logged_at and not _is_same_utc_day(logged_at, now_utc):
-            continue
+async def _flush_batch_after_window(phone_number: str) -> None:
+    await asyncio.sleep(BATCH_WINDOW_SECONDS)
+    batch = _pending_batches.pop(phone_number, None)
+    _batch_flush_tasks.pop(phone_number, None)
+    if not batch:
+        return
+    queue = _phone_queues.setdefault(phone_number, deque())
+    queue.append(batch)
+    if phone_number not in _phone_worker_tasks or _phone_worker_tasks[phone_number].done():
+        _phone_worker_tasks[phone_number] = asyncio.create_task(_run_phone_queue_worker(phone_number))
 
-        try:
-            total += float(entry.get("estimated_calories", 0) or 0)
-        except (TypeError, ValueError):
-            continue
 
-    return int(round(total))
+def _enqueue_into_batch(
+    *,
+    phone_number: str,
+    incoming_text: str,
+    media_items: list[dict[str, str]],
+    trace_id: str,
+) -> None:
+    batch = _pending_batches.get(phone_number)
+    if not batch:
+        batch = {
+            "phone_number": phone_number,
+            "texts": [],
+            "media_items": [],
+            "trace_ids": [],
+            "created_at": time.time(),
+        }
+        _pending_batches[phone_number] = batch
+
+    if incoming_text.strip():
+        batch["texts"].append(incoming_text.strip())
+    if media_items:
+        batch["media_items"].extend(media_items)
+    batch["trace_ids"].append(trace_id)
+    batch["last_event_at"] = time.time()
+
+    existing_task = _batch_flush_tasks.get(phone_number)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+    _batch_flush_tasks[phone_number] = asyncio.create_task(_flush_batch_after_window(phone_number))
+
+
+async def _run_phone_queue_worker(phone_number: str) -> None:
+    queue = _phone_queues.setdefault(phone_number, deque())
+    while queue:
+        batch = queue.popleft()
+        texts = [t for t in (batch.get("texts") or []) if isinstance(t, str) and t.strip()]
+        combined_text = "\n".join(texts).strip()
+        media_items = batch.get("media_items") or []
+        trace_ids = batch.get("trace_ids") or []
+        trace_id = trace_ids[0] if trace_ids else f"{phone_number}-{int(time.time() * 1000)}"
+        await _process_and_send_twilio_reply(
+            phone_number,
+            combined_text,
+            media_items=media_items,
+            trace_id=trace_id,
+        )
 
 
 async def _process_and_send_twilio_reply(
     phone_number: str,
     body: str,
-    media_url: Optional[str] = None,
-    media_content_type: Optional[str] = None,
+    media_items: list[dict[str, str]] | None = None,
     trace_id: str | None = None,
 ) -> None:
     request_started_at = time.perf_counter()
-    reply_message = "Bhai, give me a second, optimizing your plan..."
+    reply_message = "Give me a second, optimizing your plan..."
+    quota_warning_suffix = ""
     phone_lock = _phone_locks.setdefault(phone_number, asyncio.Lock())
+    media_items = media_items or []
 
     async def _run_pipeline() -> None:
-        nonlocal reply_message
+        nonlocal reply_message, quota_warning_suffix
         log_agent_event(
             agent="front_desk",
             stage="pipeline_start",
             trace_id=trace_id,
             details={
                 "phone_number": phone_number,
-                "has_media": bool(media_url),
-                "media_type": media_content_type or "",
+                "has_media": bool(media_items),
+                "media_count": len(media_items),
             },
         )
+        quota_result = consume_daily_turn_quota(
+            phone_number=phone_number,
+            timezone_name=SCHEDULER_TIMEZONE,
+            daily_limit=TRIAL_DAILY_TURN_LIMIT,
+            warning_threshold=TRIAL_DAILY_TURN_WARNING_THRESHOLD,
+        )
+        log_agent_event(
+            agent="quota_gate",
+            stage="consumed_turn",
+            trace_id=trace_id,
+            details={
+                "used_turns": int(quota_result.get("used_turns") or 0),
+                "limit": int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
+                "blocked": bool(quota_result.get("blocked")),
+            },
+        )
+        if bool(quota_result.get("blocked")):
+            reply_message = trial_limit_wall(daily_limit=TRIAL_DAILY_TURN_LIMIT)
+            return
+        if bool(quota_result.get("warn")):
+            quota_warning_suffix = trial_limit_warning(
+                used_turns=int(quota_result.get("used_turns") or 0),
+                daily_limit=int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
+            )
         existing_user_resp = (
             supabase.table("users")
             .select("id, living_profile")
@@ -123,6 +258,7 @@ async def _process_and_send_twilio_reply(
         print(f"[Twilio Flow] Existing user found: {bool(existing_rows)}")
 
         base_profile: dict[str, Any]
+        onboarding_was_complete = False
         if not existing_rows:
             default_profile = load_default_living_profile()
             (
@@ -133,25 +269,67 @@ async def _process_and_send_twilio_reply(
             base_profile = default_profile
         else:
             base_profile = existing_rows[0].get("living_profile") or {}
+        onboarding_was_complete = bool(base_profile.get("onboarding_complete") is True)
 
         effective_user_text = body
         voice_note_logged_this_turn = False
         source_hint = "text"
 
-        if media_url and (media_content_type or "").lower().startswith("audio/"):
+        audio_media = [
+            item
+            for item in media_items
+            if str((item or {}).get("content_type") or "").lower().startswith("audio/")
+        ]
+        image_media = [
+            item
+            for item in media_items
+            if str((item or {}).get("content_type") or "").lower().startswith("image/")
+        ]
+        transcripts: list[str] = []
+        for item in audio_media:
+            media_url = str(item.get("url") or "").strip()
+            media_content_type = str(item.get("content_type") or "audio/ogg").strip()
+            if not media_url:
+                continue
             audio_result = await ai_transcribe_voice_note(
-                media_url, media_content_type or "audio/ogg", trace_id=trace_id
+                media_url, media_content_type, trace_id=trace_id
             )
             transcript = str(audio_result.get("transcript") or "").strip()
             if transcript:
-                voice_note_logged_this_turn = True
-                source_hint = "voice"
-                effective_user_text = (
-                    transcript
-                    if not effective_user_text
-                    else f"{effective_user_text}\n\nVoice note transcript: {transcript}"
-                )
-                print("[Twilio Flow] Voice note transcribed and added to user context.")
+                transcripts.append(transcript)
+        if transcripts:
+            voice_note_logged_this_turn = True
+            source_hint = "voice"
+            merged_transcript = "\n".join(transcripts).strip()
+            effective_user_text = (
+                merged_transcript
+                if not effective_user_text
+                else f"{effective_user_text}\n\nVoice note transcript: {merged_transcript}"
+            )
+            print("[Twilio Flow] Voice note transcribed and added to user context.")
+
+        policy_result = await classify_query_policy(
+            user_message=effective_user_text,
+            has_media=bool(media_items),
+        )
+        policy_decision = str(policy_result.get("decision") or "allow")
+        policy_reason = str(policy_result.get("reason") or "normal")
+        policy_forced_mode = str(policy_result.get("forced_mode") or "push")
+        log_agent_event(
+            agent="policy_gate",
+            stage="applied",
+            trace_id=trace_id,
+            details={
+                "decision": policy_decision,
+                "reason": policy_reason,
+                "confidence": str(policy_result.get("confidence") or "low"),
+            },
+        )
+        if policy_decision == "deny":
+            reply_message = str(policy_result.get("safe_response_hint") or "").strip() or (
+                policy_out_of_scope()
+            )
+            return
 
         router_result = await classify_router_intent(
             effective_user_text,
@@ -159,6 +337,10 @@ async def _process_and_send_twilio_reply(
         )
         routed_intent = str(router_result.get("primary_intent") or "general_chat")
         routed_confidence = str(router_result.get("confidence") or "low")
+        plan_fallback_intent = classify_plan_intent_fallback(effective_user_text)
+        if plan_fallback_intent:
+            routed_intent = plan_fallback_intent
+            routed_confidence = "fallback"
         log_agent_event(
             agent="router",
             stage="applied",
@@ -166,12 +348,45 @@ async def _process_and_send_twilio_reply(
             details={"intent": routed_intent, "confidence": routed_confidence},
         )
 
+        merged_profile = ensure_plan_state(base_profile)
+        merged_profile, plan_confirmation = apply_plan_confirmation_if_any(
+            merged_profile,
+            effective_user_text,
+        )
+        if plan_confirmation is not None:
+            if plan_confirmation.get("decision") == "approved":
+                routed_intent = "plan_edit_request"
+            else:
+                routed_intent = "general_chat"
+
+        historical_result: dict[str, Any] | None = None
+        if routed_intent == "historical_query":
+            target_date = resolve_target_date(effective_user_text, "Asia/Kolkata")
+            if target_date:
+                historical_result = fetch_historical_day(phone_number, target_date)
+                log_agent_event(
+                    agent="router",
+                    stage="historical_fetch",
+                    trace_id=trace_id,
+                    details={
+                        "target_date": target_date,
+                        "found": bool(historical_result),
+                    },
+                )
+            else:
+                log_agent_event(
+                    agent="router",
+                    stage="historical_fetch",
+                    status="missing_date",
+                    trace_id=trace_id,
+                )
+
         memory_started_at = time.perf_counter()
         extracted_updates: dict[str, Any] = {}
-        if routed_intent != "burn_query":
+        if routed_intent not in {"burn_query", *PLAN_INTENTS}:
             extracted_updates = await ai_memory_clerk(
                 effective_user_text,
-                base_profile,
+                merged_profile,
                 source_hint=source_hint,
                 trace_id=trace_id,
             )
@@ -262,16 +477,14 @@ async def _process_and_send_twilio_reply(
                     extracted_logs.pop("current_day", None)
             extracted_updates["logs"] = extracted_logs
 
-        merged_profile = deep_merge_profile(base_profile, extracted_updates)
+        merged_profile = deep_merge_profile(merged_profile, extracted_updates)
         nutrition_logged_this_turn = False
         workout_logged_this_turn = False
         workout_highlight = ""
         activity_burn_logged_this_turn = False
         activity_assumptions: list[str] = []
         activity_burn_added = 0
-        has_image_media = bool(
-            media_url and (media_content_type or "").lower().startswith("image/")
-        )
+        has_image_media = bool(image_media)
 
         # If image is present, trust vision model for food logging and skip text/voice food placeholders.
         if has_image_media and extracted_nutrition_entries:
@@ -300,25 +513,49 @@ async def _process_and_send_twilio_reply(
             )
 
         if has_image_media:
-            vision_updates = await ai_nutrition_from_image(
-                media_url, merged_profile, trace_id=trace_id
-            )
-            food_log_entry = vision_updates.get("food_log_entry")
-            if isinstance(food_log_entry, dict):
-                logs = merged_profile.get("logs") or {}
-                nutrition_log = logs.get("nutrition_log") or []
-                if not isinstance(nutrition_log, list):
-                    nutrition_log = []
-                nutrition_log.append(food_log_entry)
-                food_log_entry.setdefault(
-                    "logged_at", datetime.now(timezone.utc).isoformat()
+            rejected_non_fitness_images = 0
+            for item in image_media:
+                image_url = str(item.get("url") or "").strip()
+                if not image_url:
+                    continue
+                vision_updates = await ai_nutrition_from_image(
+                    image_url, merged_profile, trace_id=trace_id
                 )
-                if body:
-                    food_log_entry.setdefault("user_message", body)
-                logs["nutrition_log"] = nutrition_log
-                merged_profile["logs"] = logs
-                nutrition_logged_this_turn = True
-                print("[Twilio Flow] Nutrition entry appended from image.")
+                vision_status = str(vision_updates.get("status") or "ok").strip().lower()
+                vision_category = str(vision_updates.get("category") or "").strip().lower()
+                if vision_status == "reject":
+                    rejected_non_fitness_images += 1
+                    log_agent_event(
+                        agent="nutritionist",
+                        stage="vision_rejected",
+                        trace_id=trace_id,
+                        details={"category": vision_category or "other"},
+                    )
+                    continue
+                food_log_entry = vision_updates.get("food_log_entry")
+                if isinstance(food_log_entry, dict):
+                    logs = merged_profile.get("logs") or {}
+                    nutrition_log = logs.get("nutrition_log") or []
+                    if not isinstance(nutrition_log, list):
+                        nutrition_log = []
+                    nutrition_log.append(food_log_entry)
+                    food_log_entry.setdefault(
+                        "logged_at", datetime.now(timezone.utc).isoformat()
+                    )
+                    if body:
+                        food_log_entry.setdefault("user_message", body)
+                    logs["nutrition_log"] = nutrition_log
+                    merged_profile["logs"] = logs
+                    nutrition_logged_this_turn = True
+            if rejected_non_fitness_images > 0:
+                has_non_media_text = bool((body or "").strip()) or bool(transcripts)
+                if (not has_non_media_text) and (rejected_non_fitness_images == len(image_media)):
+                    reply_message = (
+                        image_rejection()
+                    )
+                    return
+            if nutrition_logged_this_turn:
+                print("[Twilio Flow] Nutrition entries appended from image(s).")
 
         if (
             extracted_workout_complete is True
@@ -482,15 +719,6 @@ async def _process_and_send_twilio_reply(
             logs["current_day"] = current_day
             merged_profile["logs"] = logs
 
-        # Keep current_day calories in sync with today's nutrition log entries.
-        logs = merged_profile.get("logs") or {}
-        current_day = logs.get("current_day") or {}
-        if not isinstance(current_day, dict):
-            current_day = {}
-        current_day["cals"] = _recalculate_current_day_calories(logs)
-        logs["current_day"] = current_day
-        merged_profile["logs"] = logs
-
         # Agent 4 trigger: deterministic daily targets once math inputs are ready.
         daily_targets, missing_reason = compute_daily_targets_if_ready(
             merged_profile, trace_id=trace_id
@@ -502,13 +730,6 @@ async def _process_and_send_twilio_reply(
             physiology["biometrics"] = biometrics
             merged_profile["physiology"] = physiology
 
-            logs = merged_profile.get("logs") or {}
-            current_day = logs.get("current_day") or {}
-            if not isinstance(current_day, dict):
-                current_day = {}
-            current_day["calorie_budget"] = int(daily_targets.get("cals", 0) or 0)
-            logs["current_day"] = current_day
-            merged_profile["logs"] = logs
         else:
             log_agent_event(
                 agent="bio_math",
@@ -517,27 +738,29 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
             )
 
-        # Keep net deficit synced: (TDEE + active burn) - food eaten.
+        # Keep daily dashboard metrics synced from one deterministic source.
         logs = merged_profile.get("logs") or {}
         current_day = logs.get("current_day") or {}
         if not isinstance(current_day, dict):
             current_day = {}
-        physiology = merged_profile.get("physiology") or {}
-        biometrics = physiology.get("biometrics") or {}
-        daily_targets = biometrics.get("daily_targets") or {}
-        tdee_cals = float(daily_targets.get("tdee_cals") or 0)
-        active_cals_burnt = float(current_day.get("active_cals_burnt") or 0)
-        food_cals = float(current_day.get("cals") or 0)
-        current_day["net_deficit"] = calculate_net_deficit(
-            tdee_cals=tdee_cals,
-            active_cals_burnt=active_cals_burnt,
-            food_cals=food_cals,
-        )
+        metrics = compute_current_day_metrics(merged_profile)
+        current_day["cals"] = int(metrics.get("intake_cals") or 0)
+        current_day["active_cals_burnt"] = int(metrics.get("active_cals_burnt") or 0)
+        current_day["net_deficit"] = int(metrics.get("net_deficit_cals") or 0)
+        current_day["calorie_budget"] = int(metrics.get("calorie_budget_cals") or 0)
+        current_day["metrics"] = metrics
         logs["current_day"] = current_day
         merged_profile["logs"] = logs
 
-        completion_prompt = next_onboarding_prompt(merged_profile)
-        if "100% complete" in completion_prompt:
+        # Psychology Agent: nuanced signal extraction + deterministic bounded update.
+        psych_analysis = await analyze_psychology_signals(
+            user_message=effective_user_text,
+            living_profile=merged_profile,
+        )
+        merged_profile = apply_psychology_update(merged_profile, psych_analysis)
+
+        missing_after_merge = get_missing_onboarding_fields(merged_profile)
+        if not missing_after_merge:
             merged_profile["onboarding_complete"] = True
 
         (
@@ -564,6 +787,9 @@ async def _process_and_send_twilio_reply(
         fresh_profile = (
             refreshed_rows[0].get("living_profile") if refreshed_rows else merged_profile
         )
+        if isinstance(fresh_profile, dict):
+            # Keep transient response fields out of living_profile state.
+            fresh_profile.pop("coach_response", None)
 
         logs = fresh_profile.get("logs") or {}
         current_count = logs.get("coach_message_count", 0)
@@ -581,26 +807,89 @@ async def _process_and_send_twilio_reply(
             .execute()
         )
 
-        # Missing-data gatekeeper for deterministic macro math.
-        # Memory Clerk runs before this, so if user just shared height/age, gate auto-unlocks.
+        # Intake Agent graduation gate + deterministic macro gate.
         daily_targets_fresh, missing_reason_fresh = compute_daily_targets_if_ready(
             fresh_profile, trace_id=trace_id
         )
-        if daily_targets_fresh is None and missing_reason_fresh in {
+        missing_onboarding_now = get_missing_onboarding_fields(fresh_profile)
+        onboarding_is_complete = len(missing_onboarding_now) == 0
+
+        if not onboarding_is_complete:
+            log_agent_event(
+                agent="intake_agent",
+                stage="prompt_missing_fields",
+                trace_id=trace_id,
+                details={"missing_fields": missing_onboarding_now},
+            )
+            reply_message = build_intake_prompt(fresh_profile, missing_onboarding_now)
+        elif (
+            not onboarding_was_complete
+            and onboarding_is_complete
+            and daily_targets_fresh is not None
+        ):
+            fresh_profile["onboarding_complete"] = True
+            (
+                supabase.table("users")
+                .update({"living_profile": fresh_profile})
+                .eq("phone_number", phone_number)
+                .execute()
+            )
+            reply_message = build_graduation_message(fresh_profile)
+            log_agent_event(
+                agent="intake_agent",
+                stage="graduated",
+                trace_id=trace_id,
+                details={
+                    "daily_target_cals": (daily_targets_fresh or {}).get("cals", 0),
+                    "daily_target_protein": (daily_targets_fresh or {}).get("protein_g", 0),
+                },
+            )
+        elif daily_targets_fresh is None and missing_reason_fresh in {
             "missing_height_or_age",
             "missing_gender",
         }:
-            log_agent_event(
-                agent="intake_agent",
-                stage="math_gate_prompt",
-                status=missing_reason_fresh,
-                trace_id=trace_id,
+            reply_message = (
+                onboarding_missing_biometrics()
+            )
+        elif routed_intent == "plan_change_signal":
+            fresh_profile = upsert_pending_change_request(
+                fresh_profile, effective_user_text
+            )
+            (
+                supabase.table("users")
+                .update({"living_profile": fresh_profile})
+                .eq("phone_number", phone_number)
+                .execute()
             )
             reply_message = (
-                "Bhai, I need to calculate your exact macros for the December goal. "
-                "What is your height, age, and gender?"
+                "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
             )
         else:
+            latest_plan = None
+            if routed_intent in PLAN_INTENTS:
+                latest_plan = fetch_latest_plan_version(phone_number)
+                if latest_plan:
+                    plan_payload = latest_plan.get("plan_payload") or {}
+                    plans = (fresh_profile.get("plans") or {})
+                    active = (plans.get("active") or {})
+                    active["plan_id"] = latest_plan.get("plan_id") or active.get("plan_id")
+                    active["version"] = int(float(latest_plan.get("version") or 0))
+                    active["status"] = latest_plan.get("status") or "active"
+                    if isinstance(plan_payload, dict):
+                        active["type"] = str(
+                            plan_payload.get("type")
+                            or ((plan_payload.get("meta") or {}).get("type") or "hybrid")
+                        )
+                        active["horizon"] = str(
+                            plan_payload.get("horizon")
+                            or ((plan_payload.get("meta") or {}).get("horizon") or "weekly")
+                        )
+                        active["current_block"] = plan_payload.get("current_block") or {}
+                        active["week_blocks"] = plan_payload.get("week_blocks") or []
+                        active["day_actions"] = plan_payload.get("day_actions") or []
+                        active["constraints"] = plan_payload.get("constraints") or {}
+                    plans["active"] = active
+                    fresh_profile["plans"] = plans
             coach_started_at = time.perf_counter()
             coach_reply = await generate_coach_reply(
                 effective_user_text,
@@ -615,32 +904,30 @@ async def _process_and_send_twilio_reply(
                     "activity_assumptions": activity_assumptions[:3],
                     "routed_intent": routed_intent,
                     "router_confidence": routed_confidence,
-                    "burn_facts": {
-                        "active_cals_burnt": int(
-                            float(
-                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
-                                    "active_cals_burnt", 0
-                                )
-                                or 0
+                    "burn_facts": dict(
+                        (
+                            ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
+                                "metrics"
                             )
-                        ),
-                        "intake_cals": int(
-                            float(
-                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
-                                    "cals", 0
-                                )
-                                or 0
+                            or {}
+                        )
+                    ),
+                    "historical_query_result": historical_result,
+                    "plan_context": build_plan_compact_for_prompt(fresh_profile),
+                    "response_mode": (
+                        policy_forced_mode
+                        if policy_decision == "allow_constrained"
+                        else (
+                            (
+                                (psych_analysis or {}).get("response_mode")
+                                if isinstance(psych_analysis, dict)
+                                else "push"
                             )
-                        ),
-                        "net_deficit": int(
-                            float(
-                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
-                                    "net_deficit", 0
-                                )
-                                or 0
-                            )
-                        ),
-                    },
+                            or "push"
+                        )
+                    ),
+                    "policy_decision": policy_decision,
+                    "policy_reason": policy_reason,
                 },
                 trace_id=trace_id,
             )
@@ -648,12 +935,84 @@ async def _process_and_send_twilio_reply(
             print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
             if coach_reply.strip():
                 reply_message = coach_reply.strip()
+                if routed_intent in {"plan_create_request", "plan_edit_request"}:
+                    reason = (
+                        "create"
+                        if routed_intent == "plan_create_request"
+                        else "edit"
+                    )
+                    plan_context = build_plan_compact_for_prompt(fresh_profile)
+                    structured = await generate_structured_plan(
+                        user_message=effective_user_text,
+                        living_profile=fresh_profile,
+                        plan_context=plan_context,
+                    )
+                    inferred_type, inferred_horizon = infer_plan_type_and_horizon(
+                        effective_user_text
+                    )
+                    plan_type = str(structured.get("type") or inferred_type)
+                    horizon = str(structured.get("horizon") or inferred_horizon)
+                    week_blocks = structured.get("week_blocks") or []
+                    day_actions = structured.get("day_actions") or []
+                    response_text = str(structured.get("response_text") or "").strip()
+                    if response_text:
+                        coached = await run_critic_agent(
+                            response_text,
+                            source="plan_agent",
+                            living_profile=fresh_profile,
+                            trace_id=trace_id,
+                        )
+                        if coached.strip():
+                            reply_message = coached.strip()
+                    fresh_profile = persist_plan_version(
+                        phone_number=phone_number,
+                        living_profile=fresh_profile,
+                        plan_text=reply_message,
+                        change_reason=reason,
+                        horizon_weeks=12,
+                        plan_type=plan_type,
+                        horizon=horizon,
+                        week_blocks=week_blocks,
+                        day_actions=day_actions,
+                    )
+                    (
+                        supabase.table("users")
+                        .update({"living_profile": fresh_profile})
+                        .eq("phone_number", phone_number)
+                        .execute()
+                    )
         log_agent_event(
             agent="front_desk",
             stage="pipeline_complete",
             trace_id=trace_id,
             details={"reply_chars": len(reply_message)},
         )
+
+    done_event = asyncio.Event()
+
+    async def _send_delay_pings() -> None:
+        checkpoints = [
+            (30, "Aapka context review kar raha hoon. Kripya thoda sa aur time dijiye."),
+            (60, "Heavy analysis chal raha hai. Almost there."),
+            (90, "Bas final checks bache hain. Answer bhej raha hoon."),
+            (
+                150,
+                "Still processing. Final response ready hote hi seedha bhej dunga.",
+            ),
+        ]
+        started = time.monotonic()
+        for seconds, message in checkpoints:
+            remaining = seconds - (time.monotonic() - started)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if done_event.is_set():
+                return
+            try:
+                await send_whatsapp_message(phone_number, message)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Twilio Delay Ping Error] {exc}")
+
+    ping_task = asyncio.create_task(_send_delay_pings())
 
     try:
         async with phone_lock:
@@ -668,12 +1027,17 @@ async def _process_and_send_twilio_reply(
             details={"error": str(exc)},
         )
         reply_message = (
-            "Bhai, AI service abhi thoda busy hai. Tension mat le, 20-30 seconds me "
-            "dobara ping kar."
+            pipeline_busy_retry()
         )
     finally:
+        done_event.set()
+        if not ping_task.done():
+            ping_task.cancel()
         total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
         print(f"[Twilio Timing] Total async processing time: {total_elapsed_ms} ms")
+
+    if quota_warning_suffix and "trial limit" not in reply_message.lower():
+        reply_message = f"{reply_message}{quota_warning_suffix}"
 
     try:
         await send_whatsapp_message(phone_number, reply_message)
@@ -730,7 +1094,7 @@ async def receive_whatsapp_webhook(request: Request) -> JSONResponse:
 
 @router.post("/twilio-webhook")
 async def receive_twilio_webhook(
-    background_tasks: BackgroundTasks,
+    request: Request,
     From: Optional[str] = Form(None),
     Body: Optional[str] = Form(None),
     NumMedia: Optional[str] = Form(None),
@@ -761,19 +1125,21 @@ async def receive_twilio_webhook(
         media_count = int(NumMedia or "0")
     except (TypeError, ValueError):
         media_count = 0
-    media_url = MediaUrl0 if media_count > 0 and MediaUrl0 else None
-    media_content_type = MediaContentType0 if media_count > 0 and MediaContentType0 else None
-    if media_url:
-        print(
-            f"[Twilio Incoming] Media detected. MediaUrl0 present for {phone_number}. "
-            f"content_type={media_content_type or 'unknown'}"
-        )
+    form_data = await request.form()
+    media_items: list[dict[str, str]] = []
+    for i in range(max(media_count, 0)):
+        url = str(form_data.get(f"MediaUrl{i}") or "").strip()
+        ctype = str(form_data.get(f"MediaContentType{i}") or "").strip()
+        if url:
+            media_items.append({"url": url, "content_type": ctype})
+    if media_items:
+        print(f"[Twilio Incoming] Media detected for {phone_number}. count={len(media_items)}")
 
     # Guard 1: status callbacks are not user chat messages.
     # IMPORTANT: inbound user events may carry SmsStatus=received, so do not drop
     # them when actual message content (text/media) is present.
     callback_status = (MessageStatus or SmsStatus or "").strip().lower()
-    has_user_content = bool(incoming_text) or media_count > 0
+    has_user_content = bool(incoming_text) or len(media_items) > 0
     is_outbound_status_callback = callback_status in OUTBOUND_STATUS_VALUES
     if is_outbound_status_callback and not has_user_content:
         print(
@@ -786,7 +1152,7 @@ async def receive_twilio_webhook(
         )
 
     # Guard 2: ignore empty non-content events.
-    if not incoming_text and media_count == 0:
+    if not incoming_text and len(media_items) == 0:
         print(f"[Twilio Event] type=empty_filtered from={phone_number}")
         return Response(
             content=_safe_twiml_message("No message content received."),
@@ -795,19 +1161,28 @@ async def receive_twilio_webhook(
 
     # Guard 3: ignore sandbox-origin system echoes/events.
     sandbox_source = TWILIO_WHATSAPP_FROM.removeprefix("whatsapp:").strip()
-    if sandbox_source and phone_number == sandbox_source and not incoming_text and media_count == 0:
+    if sandbox_source and phone_number == sandbox_source and not incoming_text and len(media_items) == 0:
         print(f"[Twilio Event] type=sandbox_filtered from={phone_number}")
         return Response(
             content=_safe_twiml_message("Sandbox event ignored."),
             media_type="application/xml",
         )
 
+    if not _try_record_message_sid(MessageSid or "", phone_number):
+        print(f"[Twilio Event] type=duplicate_message_sid from={phone_number}")
+        return Response(
+            content=_safe_twiml_message("Duplicate event skipped."),
+            media_type="application/xml",
+        )
+
     # Guard 4: dedupe near-identical repeated events/retries.
     now_ts = time.time()
     _cleanup_recent_events(now_ts)
+    event_media_sig = ",".join(
+        [f"{(m.get('url') or '')}|{(m.get('content_type') or '')}" for m in media_items]
+    )
     event_key = (
-        f"{phone_number}|{incoming_text}|{media_url or ''}|"
-        f"{media_content_type or ''}|{MessageSid or ''}"
+        f"{phone_number}|{incoming_text}|{event_media_sig}|{MessageSid or ''}"
     )
     if event_key in _recent_twilio_events:
         print(f"[Twilio Event] type=duplicate from={phone_number}")
@@ -818,22 +1193,35 @@ async def receive_twilio_webhook(
     _recent_twilio_events[event_key] = now_ts
     print(
         f"[Twilio Event] type=real_user from={phone_number} "
-        f"has_text={bool(incoming_text)} media_count={media_count}"
+        f"has_text={bool(incoming_text)} media_count={len(media_items)}"
     )
 
-    background_tasks.add_task(
-        _process_and_send_twilio_reply,
-        phone_number,
-        incoming_text,
-        media_url,
-        media_content_type,
-        trace_id,
+    _enqueue_into_batch(
+        phone_number=phone_number,
+        incoming_text=incoming_text,
+        media_items=media_items,
+        trace_id=trace_id,
     )
-    print("[Twilio Ack] Responding immediately; processing reply in background.")
+    print(
+        f"[Twilio Batch] Event added for {phone_number}. "
+        f"buffer_window_seconds={BATCH_WINDOW_SECONDS}"
+    )
+
+    has_audio = any(
+        str((m or {}).get("content_type") or "").lower().startswith("audio/")
+        for m in media_items
+    )
+    has_image = any(
+        str((m or {}).get("content_type") or "").lower().startswith("image/")
+        for m in media_items
+    )
+    ack_text = _contextual_ack_message(
+        has_audio=has_audio,
+        has_image=has_image,
+        user_text=incoming_text,
+    )
     return Response(
-        content=_safe_twiml_message(
-            "Bhai, got your message. Processing with AI now, sending full reply shortly."
-        ),
+        content=_safe_twiml_message(ack_text),
         media_type="application/xml",
     )
 

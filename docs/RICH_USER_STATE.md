@@ -40,6 +40,22 @@
     },
     "volume_trends": [],
     "last_3_workout_summaries": []
+  },
+  "plans": {
+    "active": {
+      "plan_id": "",
+      "version": 0,
+      "status": "none",
+      "type": "hybrid",
+      "horizon": "weekly",
+      "horizon_weeks": 0,
+      "constraints": {},
+      "current_block": {},
+      "week_blocks": [],
+      "day_actions": [],
+      "pending_change_request": {}
+    },
+    "change_log": []
   }
 }
 ```

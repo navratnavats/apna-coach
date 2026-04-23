@@ -40,7 +40,7 @@ SCHEDULER_ENABLED: bool = os.getenv("SCHEDULER_ENABLED", "true").lower() == "tru
 CHECKIN_INTERVAL_MINUTES: int = int(os.getenv("CHECKIN_INTERVAL_MINUTES", "360"))
 CHECKIN_MESSAGE: str = os.getenv(
     "CHECKIN_MESSAGE",
-    "Bhai, this is an automated check-in. Have you worked out today?",
+    "{address}, this is an automated check-in. Have you worked out today?",
 )
 
 # Nightly Dietitian review settings.
@@ -55,4 +55,10 @@ SCHEDULER_TIMEZONE: str = os.getenv("SCHEDULER_TIMEZONE", "Asia/Kolkata")
 MORNING_NUDGE_ENABLED: bool = os.getenv("MORNING_NUDGE_ENABLED", "true").lower() == "true"
 MORNING_NUDGE_HOUR: int = int(os.getenv("MORNING_NUDGE_HOUR", "8"))
 MORNING_NUDGE_MINUTE: int = int(os.getenv("MORNING_NUDGE_MINUTE", "0"))
+
+# Trial usage quota settings (counted per stitched AI turn).
+TRIAL_DAILY_TURN_LIMIT: int = int(os.getenv("TRIAL_DAILY_TURN_LIMIT", "25"))
+TRIAL_DAILY_TURN_WARNING_THRESHOLD: int = int(
+    os.getenv("TRIAL_DAILY_TURN_WARNING_THRESHOLD", "20")
+)
 

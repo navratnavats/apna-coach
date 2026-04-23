@@ -19,6 +19,7 @@ from app.config import (
     TWILIO_AUTH_TOKEN,
 )
 from app.services.agent_trace import log_agent_event
+from app.services.persona import resolve_user_address
 
 
 def load_default_living_profile() -> dict[str, Any]:
@@ -94,17 +95,25 @@ async def ai_memory_clerk(
         "- Use existing schema keys.\n"
         "- If injuries are present, return under physiology.injuries as an array "
         "of objects with keys: part, severity, history, pain_triggers.\n"
+        "- If user says no injuries (none/no issue/fit), still set physiology.injuries "
+        "to a non-empty list with one safe marker object.\n"
         "- If weight is present, set physiology.biometrics.weight as number in kg.\n"
         "- If height is present, set physiology.biometrics.height as number in centimeters.\n"
         "- If age is present, set physiology.biometrics.age as integer in years.\n"
+        "- If target weight is present, set physiology.biometrics.target as number in kg.\n"
         "- If name is present, set identity.name.\n"
         "- If gender is present, set identity.gender (e.g., male/female).\n"
+        "- If user states how they want to be addressed (e.g., 'call me brother', "
+        "'call me by name', 'don't call me bhai'), set identity.preferred_title.\n"
+        "- For 'call me by name', set identity.preferred_title to 'name'.\n"
         "- If goal is present, set psychology.core_why.\n"
         "- If user mentions training setup (home/gym/park/travel), set "
         "lifestyle.training_environment.\n"
         "- If user mentions equipment (dumbbells, kettlebell, resistance band, "
         "pull-up bar, yoga mat, barbell, treadmill, full gym, etc), save as "
         "lifestyle.available_equipment string array.\n"
+        "- If user says they have no equipment/bodyweight only, set "
+        "lifestyle.available_equipment to ['bodyweight'].\n"
         "- Normalize equipment names into concise lowercase tokens.\n"
         "- Detect Food Logging Intent from text/transcript (e.g., 'khaya', 'ate', "
         "'breakfast/lunch/dinner', meal names like Butter Chicken, Dal Makhani, Poha).\n"
@@ -207,10 +216,18 @@ async def ai_nutrition_from_image(
     )
 
     system_prompt = (
-        "You are the Memory Clerk for Apna Coach. Analyze the food image and return "
-        "ONLY a JSON object with estimated nutrition details.\n\n"
+        "You are the Memory Clerk for Apna Coach. Analyze the image and return "
+        "ONLY a JSON object.\n\n"
+        "Strict validation rule:\n"
+        "- If image is clearly NOT one of: food meal, gym equipment, or human body/physique, "
+        "return reject immediately.\n"
+        "- For reject, do not estimate nutrition.\n"
+        "- For gym equipment/body images, do not hallucinate food.\n\n"
         "Return format:\n"
         "{\n"
+        '  "status": "ok|reject",\n'
+        '  "category": "food|gym_equipment|human_body|other",\n'
+        '  "rejection_message": "optional short reason",\n'
         '  "food_log_entry": {\n'
         '    "source": "image",\n'
         '    "summary": "short description of meal",\n'
@@ -219,6 +236,8 @@ async def ai_nutrition_from_image(
         '    "confidence": "low|medium|high"\n'
         "  }\n"
         "}\n"
+        "- If status='reject', set food_log_entry to null.\n"
+        "- If category is gym_equipment or human_body, status should be ok but food_log_entry must be null.\n"
         "Do not output markdown. Do not include any extra text."
     )
 
@@ -329,6 +348,7 @@ async def ai_transcribe_voice_note(
 
 
 def next_onboarding_prompt(profile: dict[str, Any]) -> str:
+    address = resolve_user_address(profile)
     identity = profile.get("identity") or {}
     physiology = profile.get("physiology") or {}
     psychology = profile.get("psychology") or {}
@@ -347,7 +367,7 @@ def next_onboarding_prompt(profile: dict[str, Any]) -> str:
     core_why_missing = str(psychology.get("core_why") or "").strip() == ""
 
     if name_missing:
-        return "Bhai, what is your name?"
+        return f"{address}, what is your name?"
     if weight_missing:
         return "To give you the best coaching, what is your current weight (in kg)?"
     if injuries_missing:
@@ -360,7 +380,7 @@ def next_onboarding_prompt(profile: dict[str, Any]) -> str:
             "building muscle, or just staying active?)"
         )
     return (
-        "Bhai, your profile is now 100% complete! Give me 5 seconds to analyze "
+        f"{address}, your profile is now 100% complete! Give me 5 seconds to analyze "
         "your stats and create your personalized coaching plan... 🦾"
     )
 

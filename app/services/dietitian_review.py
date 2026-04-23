@@ -12,6 +12,14 @@ from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
 from app.services.critic_agent import run_critic_agent
+from app.services.messages import (
+    dietitian_default_line,
+    dietitian_no_logs,
+    dietitian_over_budget_line,
+    dietitian_quick_review,
+    dietitian_review_ready,
+)
+from app.services.persona import resolve_user_address
 
 
 def _today_nutrition_entries(
@@ -56,6 +64,7 @@ async def generate_dietitian_review(
     Generate end-of-day concise accountability message from today's nutrition log.
     """
     today_entries = _today_nutrition_entries(living_profile, timezone_name)
+    address = resolve_user_address(living_profile)
     log_agent_event(
         agent="dietitian",
         stage="start",
@@ -64,8 +73,9 @@ async def generate_dietitian_review(
     )
     if not today_entries:
         return await run_critic_agent(
-            "Bhai, aaj kuch khaya nahi ya log karna bhool gaye? Aise progress nahi hogi.",
+            dietitian_no_logs(address),
             source="dietitian_review",
+            living_profile=living_profile,
             trace_id=trace_id,
         )
 
@@ -90,14 +100,13 @@ async def generate_dietitian_review(
         if total_protein >= estimated_protein_goal:
             lines.append("Protein intake on point today. Muscle recovery sorted.")
         if has_calorie_budget and total_calories > calorie_budget:
-            lines.append("Calorie budget exceed ho gaya hai. Kal subah extra 2km run pakka.")
+            lines.append(dietitian_over_budget_line())
         if not lines:
-            lines.append(
-                "Bhai, aaj ka nutrition theek gaya. Kal logging aur protein consistency pe focus kar."
-            )
+            lines.append(dietitian_default_line(address))
         return await run_critic_agent(
             " ".join(lines),
             source="dietitian_review",
+            living_profile=living_profile,
             trace_id=trace_id,
         )
 
@@ -113,7 +122,7 @@ async def generate_dietitian_review(
         "- If protein_goal_hit is true, include this exact sentence: "
         "'Protein intake on point today. Muscle recovery sorted.'\n"
         "- If over_calorie_budget is true, include this exact sentence: "
-        "'Calorie budget exceed ho gaya hai. Kal subah extra 2km run pakka.'\n"
+        f"'{dietitian_over_budget_line()}'\n"
         "- Plain text only, no markdown."
     )
 
@@ -147,20 +156,18 @@ async def generate_dietitian_review(
         print(f"[Dietitian] LLM review failed: {exc}")
         return await run_critic_agent(
             (
-            "Bhai, quick review: aaj ka logging complete rakha, great. Kal protein thoda "
-            "aur consistent rakhte hain aur water target hit karte hain."
+            dietitian_quick_review(address)
             ),
             source="dietitian_review",
+            living_profile=living_profile,
             trace_id=trace_id,
         )
 
     final = await run_critic_agent(
         text
-        or (
-        "Bhai, aaj ka nutrition review ready hai. Kal se thoda aur disciplined logging "
-        "aur protein focus rakhenge."
-        ),
+        or dietitian_review_ready(address),
         source="dietitian_review",
+        living_profile=living_profile,
         trace_id=trace_id,
     )
     log_agent_event(

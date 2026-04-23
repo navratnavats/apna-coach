@@ -16,7 +16,9 @@ from app.config import (
 )
 from app.services.agent_trace import log_agent_event
 from app.services.dietitian_review import generate_dietitian_review
+from app.services.eod_compression import compress_today_for_archive
 from app.services.morning_programmer import generate_morning_workout_nudge
+from app.services.persona import resolve_user_address
 from app.services.twilio_messaging import send_whatsapp_message
 
 
@@ -36,6 +38,7 @@ async def run_proactive_checkin_job() -> None:
 
         for row in rows:
             phone_number = row.get("phone_number")
+            living_profile = row.get("living_profile") or {}
             if not phone_number:
                 continue
             try:
@@ -45,7 +48,14 @@ async def run_proactive_checkin_job() -> None:
                     stage="scheduler_checkin_send",
                     trace_id=trace_id,
                 )
-                await send_whatsapp_message(phone_number, CHECKIN_MESSAGE)
+                address = resolve_user_address(living_profile)
+                if "{address}" in CHECKIN_MESSAGE:
+                    message = CHECKIN_MESSAGE.format(address=address)
+                elif CHECKIN_MESSAGE.lower().startswith("bhai,"):
+                    message = f"{address},{CHECKIN_MESSAGE[5:]}"
+                else:
+                    message = f"{address}, {CHECKIN_MESSAGE}"
+                await send_whatsapp_message(phone_number, message)
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed check-in for {phone_number}: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -83,6 +93,42 @@ async def run_dietitian_review_job() -> None:
                     trace_id=trace_id,
                     details={"chars": len(review_text)},
                 )
+
+                compressed_profile, archive_payload = compress_today_for_archive(
+                    living_profile,
+                    SCHEDULER_TIMEZONE,
+                    trace_id=trace_id,
+                )
+                if archive_payload is not None:
+                    archive_insert = (
+                        supabase.table("historical_archive")
+                        .insert(
+                            {
+                                "phone_number": phone_number,
+                                "archive_date": archive_payload.get("date"),
+                                "summary_line": archive_payload.get("summary_line"),
+                                "metrics": archive_payload.get("metrics"),
+                                "nutrition_entries": archive_payload.get("nutrition_entries"),
+                                "activity_entries": archive_payload.get("activity_entries"),
+                            }
+                        )
+                        .execute()
+                    )
+                    (
+                        supabase.table("users")
+                        .update({"living_profile": compressed_profile})
+                        .eq("phone_number", phone_number)
+                        .execute()
+                    )
+                    log_agent_event(
+                        agent="front_desk",
+                        stage="scheduler_eod_saved",
+                        trace_id=trace_id,
+                        details={
+                            "date": archive_payload.get("date"),
+                            "archive_inserted": bool(archive_insert.data),
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed dietitian review for {phone_number}: {exc}")
     except Exception as exc:  # noqa: BLE001
