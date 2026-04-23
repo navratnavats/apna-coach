@@ -14,6 +14,7 @@ from app.config import (
     MORNING_NUDGE_MINUTE,
     SCHEDULER_TIMEZONE,
 )
+from app.services.agent_trace import log_agent_event
 from app.services.dietitian_review import generate_dietitian_review
 from app.services.morning_programmer import generate_morning_workout_nudge
 from app.services.twilio_messaging import send_whatsapp_message
@@ -38,6 +39,12 @@ async def run_proactive_checkin_job() -> None:
             if not phone_number:
                 continue
             try:
+                trace_id = f"scheduler-checkin-{phone_number}"
+                log_agent_event(
+                    agent="front_desk",
+                    stage="scheduler_checkin_send",
+                    trace_id=trace_id,
+                )
                 await send_whatsapp_message(phone_number, CHECKIN_MESSAGE)
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed check-in for {phone_number}: {exc}")
@@ -65,10 +72,17 @@ async def run_dietitian_review_job() -> None:
             if not phone_number:
                 continue
             try:
+                trace_id = f"scheduler-dietitian-{phone_number}"
                 review_text = await generate_dietitian_review(
-                    living_profile, SCHEDULER_TIMEZONE
+                    living_profile, SCHEDULER_TIMEZONE, trace_id=trace_id
                 )
                 await send_whatsapp_message(phone_number, review_text)
+                log_agent_event(
+                    agent="front_desk",
+                    stage="scheduler_dietitian_sent",
+                    trace_id=trace_id,
+                    details={"chars": len(review_text)},
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed dietitian review for {phone_number}: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -95,8 +109,17 @@ async def run_morning_workout_nudge_job() -> None:
             if not phone_number:
                 continue
             try:
-                message = await generate_morning_workout_nudge(living_profile)
+                trace_id = f"scheduler-morning-{phone_number}"
+                message = await generate_morning_workout_nudge(
+                    living_profile, trace_id=trace_id
+                )
                 await send_whatsapp_message(phone_number, message)
+                log_agent_event(
+                    agent="front_desk",
+                    stage="scheduler_morning_sent",
+                    trace_id=trace_id,
+                    details={"chars": len(message)},
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed morning nudge for {phone_number}: {exc}")
     except Exception as exc:  # noqa: BLE001

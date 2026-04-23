@@ -11,6 +11,13 @@ from fastapi.responses import JSONResponse
 
 from app.clients.supabase_client import supabase
 from app.config import TWILIO_WHATSAPP_FROM, WHATSAPP_VERIFY_TOKEN
+from app.services.agent_trace import log_agent_event
+from app.services.bio_math_agent import (
+    calculate_activity_burn,
+    calculate_net_deficit,
+    compute_daily_targets_if_ready,
+    normalize_activity_for_burn,
+)
 from app.services.coach_reply import generate_coach_reply
 from app.services.memory_clerk import (
     ai_memory_clerk,
@@ -20,6 +27,8 @@ from app.services.memory_clerk import (
     load_default_living_profile,
     next_onboarding_prompt,
 )
+from app.services.intent_router import classify_router_intent
+from app.services.profile_schema_guard import sanitize_memory_updates
 from app.services.twilio_messaging import send_whatsapp_message
 
 router = APIRouter()
@@ -85,6 +94,7 @@ async def _process_and_send_twilio_reply(
     body: str,
     media_url: Optional[str] = None,
     media_content_type: Optional[str] = None,
+    trace_id: str | None = None,
 ) -> None:
     request_started_at = time.perf_counter()
     reply_message = "Bhai, give me a second, optimizing your plan..."
@@ -92,6 +102,16 @@ async def _process_and_send_twilio_reply(
 
     async def _run_pipeline() -> None:
         nonlocal reply_message
+        log_agent_event(
+            agent="front_desk",
+            stage="pipeline_start",
+            trace_id=trace_id,
+            details={
+                "phone_number": phone_number,
+                "has_media": bool(media_url),
+                "media_type": media_content_type or "",
+            },
+        )
         existing_user_resp = (
             supabase.table("users")
             .select("id, living_profile")
@@ -120,7 +140,7 @@ async def _process_and_send_twilio_reply(
 
         if media_url and (media_content_type or "").lower().startswith("audio/"):
             audio_result = await ai_transcribe_voice_note(
-                media_url, media_content_type or "audio/ogg"
+                media_url, media_content_type or "audio/ogg", trace_id=trace_id
             )
             transcript = str(audio_result.get("transcript") or "").strip()
             if transcript:
@@ -133,10 +153,39 @@ async def _process_and_send_twilio_reply(
                 )
                 print("[Twilio Flow] Voice note transcribed and added to user context.")
 
-        memory_started_at = time.perf_counter()
-        extracted_updates = await ai_memory_clerk(
-            effective_user_text, base_profile, source_hint=source_hint
+        router_result = await classify_router_intent(
+            effective_user_text,
+            trace_id=trace_id,
         )
+        routed_intent = str(router_result.get("primary_intent") or "general_chat")
+        routed_confidence = str(router_result.get("confidence") or "low")
+        log_agent_event(
+            agent="router",
+            stage="applied",
+            trace_id=trace_id,
+            details={"intent": routed_intent, "confidence": routed_confidence},
+        )
+
+        memory_started_at = time.perf_counter()
+        extracted_updates: dict[str, Any] = {}
+        if routed_intent != "burn_query":
+            extracted_updates = await ai_memory_clerk(
+                effective_user_text,
+                base_profile,
+                source_hint=source_hint,
+                trace_id=trace_id,
+            )
+            extracted_updates = sanitize_memory_updates(
+                extracted_updates,
+                trace_id=trace_id,
+            )
+        else:
+            log_agent_event(
+                agent="memory_clerk",
+                stage="skipped",
+                status="burn_query_route",
+                trace_id=trace_id,
+            )
         memory_elapsed_ms = int((time.perf_counter() - memory_started_at) * 1000)
         print(f"[Twilio Timing] Memory clerk completed in {memory_elapsed_ms} ms")
         print(
@@ -146,6 +195,8 @@ async def _process_and_send_twilio_reply(
         extracted_nutrition_entries: list[dict[str, Any]] = []
         extracted_workout_summaries: list[dict[str, Any]] = []
         extracted_volume_trends: list[dict[str, Any]] = []
+        extracted_activity_entries: list[dict[str, Any]] = []
+        extracted_activity_adjustment: dict[str, Any] | None = None
         extracted_workout_complete: Optional[bool] = None
         extracted_water_delta_liters: Optional[float] = None
         if isinstance(extracted_logs, dict):
@@ -173,6 +224,17 @@ async def _process_and_send_twilio_reply(
             elif isinstance(raw_volume_trends, dict):
                 extracted_volume_trends.append(raw_volume_trends)
 
+            raw_activity_log = extracted_logs.get("activity_log")
+            if isinstance(raw_activity_log, list):
+                for entry in raw_activity_log:
+                    if isinstance(entry, dict):
+                        extracted_activity_entries.append(entry)
+            elif isinstance(raw_activity_log, dict):
+                extracted_activity_entries.append(raw_activity_log)
+            raw_activity_adjustment = extracted_logs.get("activity_adjustment")
+            if isinstance(raw_activity_adjustment, dict):
+                extracted_activity_adjustment = raw_activity_adjustment
+
             raw_current_day = extracted_logs.get("current_day")
             if isinstance(raw_current_day, dict):
                 if "workout_complete" in raw_current_day:
@@ -190,6 +252,8 @@ async def _process_and_send_twilio_reply(
             extracted_logs.pop("nutrition_log", None)
             extracted_logs.pop("last_3_workout_summaries", None)
             extracted_logs.pop("volume_trends", None)
+            extracted_logs.pop("activity_log", None)
+            extracted_logs.pop("activity_adjustment", None)
             if isinstance(extracted_logs.get("current_day"), dict):
                 extracted_logs["current_day"] = dict(extracted_logs["current_day"])
                 extracted_logs["current_day"].pop("workout_complete", None)
@@ -202,6 +266,9 @@ async def _process_and_send_twilio_reply(
         nutrition_logged_this_turn = False
         workout_logged_this_turn = False
         workout_highlight = ""
+        activity_burn_logged_this_turn = False
+        activity_assumptions: list[str] = []
+        activity_burn_added = 0
         has_image_media = bool(
             media_url and (media_content_type or "").lower().startswith("image/")
         )
@@ -233,7 +300,9 @@ async def _process_and_send_twilio_reply(
             )
 
         if has_image_media:
-            vision_updates = await ai_nutrition_from_image(media_url, merged_profile)
+            vision_updates = await ai_nutrition_from_image(
+                media_url, merged_profile, trace_id=trace_id
+            )
             food_log_entry = vision_updates.get("food_log_entry")
             if isinstance(food_log_entry, dict):
                 logs = merged_profile.get("logs") or {}
@@ -301,6 +370,105 @@ async def _process_and_send_twilio_reply(
                 elif summary_text:
                     workout_highlight = summary_text
 
+        if extracted_activity_entries:
+            logs = merged_profile.get("logs") or {}
+            activity_log = logs.get("activity_log") or []
+            if not isinstance(activity_log, list):
+                activity_log = []
+            current_day = logs.get("current_day") or {}
+            if not isinstance(current_day, dict):
+                current_day = {}
+            physiology = merged_profile.get("physiology") or {}
+            biometrics = physiology.get("biometrics") or {}
+            weight_kg = float(biometrics.get("weight") or 0)
+
+            for raw_activity in extracted_activity_entries:
+                normalized = normalize_activity_for_burn(raw_activity)
+                burn_cals = 0
+                if weight_kg > 0:
+                    burn_cals = calculate_activity_burn(
+                        met_score=float(normalized.get("met_score_used") or 0),
+                        duration_mins=float(normalized.get("effective_duration_mins") or 0),
+                        weight_kg=weight_kg,
+                    )
+                entry = dict(normalized)
+                entry["burn_cals"] = burn_cals
+                entry.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
+                entry.setdefault("source", source_hint)
+                if body:
+                    entry.setdefault("user_message", body)
+                activity_log.append(entry)
+                activity_burn_added += burn_cals
+                assumption_note = str(entry.get("assumption_note") or "").strip()
+                if assumption_note:
+                    activity_assumptions.append(assumption_note)
+
+            try:
+                existing_active = int(float(current_day.get("active_cals_burnt") or 0))
+            except (TypeError, ValueError):
+                existing_active = 0
+            current_day["active_cals_burnt"] = existing_active + activity_burn_added
+            logs["activity_log"] = activity_log
+            logs["current_day"] = current_day
+            merged_profile["logs"] = logs
+            activity_burn_logged_this_turn = activity_burn_added > 0
+            log_agent_event(
+                agent="bio_math",
+                stage="activity_burn_updated",
+                trace_id=trace_id,
+                details={"entries": len(extracted_activity_entries), "added_cals": activity_burn_added},
+            )
+
+        if extracted_activity_adjustment:
+            logs = merged_profile.get("logs") or {}
+            activity_log = logs.get("activity_log") or []
+            current_day = logs.get("current_day") or {}
+            if isinstance(activity_log, list) and activity_log and isinstance(current_day, dict):
+                mode = str(extracted_activity_adjustment.get("mode") or "").strip().lower()
+                if mode == "recalculate_last":
+                    last_idx = len(activity_log) - 1
+                    last_entry = activity_log[last_idx]
+                    if isinstance(last_entry, dict):
+                        rest_style = extracted_activity_adjustment.get("rest_style")
+                        if rest_style:
+                            last_entry["rest_style"] = rest_style
+                        normalized = normalize_activity_for_burn(last_entry)
+                        for key, value in normalized.items():
+                            last_entry[key] = value
+                        physiology = merged_profile.get("physiology") or {}
+                        biometrics = physiology.get("biometrics") or {}
+                        weight_kg = float(biometrics.get("weight") or 0)
+                        old_burn = int(float(last_entry.get("burn_cals") or 0))
+                        new_burn = (
+                            calculate_activity_burn(
+                                met_score=float(normalized.get("met_score_used") or 0),
+                                duration_mins=float(normalized.get("effective_duration_mins") or 0),
+                                weight_kg=weight_kg,
+                            )
+                            if weight_kg > 0
+                            else old_burn
+                        )
+                        delta = new_burn - old_burn
+                        last_entry["burn_cals"] = new_burn
+                        activity_log[last_idx] = last_entry
+                        current_day["active_cals_burnt"] = int(
+                            float(current_day.get("active_cals_burnt") or 0) + delta
+                        )
+                        logs["activity_log"] = activity_log
+                        logs["current_day"] = current_day
+                        merged_profile["logs"] = logs
+                        assumption_note = str(last_entry.get("assumption_note") or "").strip()
+                        if assumption_note:
+                            activity_assumptions.append(assumption_note)
+                        activity_burn_logged_this_turn = True
+                        activity_burn_added += delta
+                        log_agent_event(
+                            agent="bio_math",
+                            stage="activity_burn_recalculated",
+                            trace_id=trace_id,
+                            details={"delta_cals": delta, "new_burn": new_burn},
+                        )
+
         if extracted_water_delta_liters and extracted_water_delta_liters > 0:
             logs = merged_profile.get("logs") or {}
             current_day = logs.get("current_day") or {}
@@ -323,6 +491,51 @@ async def _process_and_send_twilio_reply(
         logs["current_day"] = current_day
         merged_profile["logs"] = logs
 
+        # Agent 4 trigger: deterministic daily targets once math inputs are ready.
+        daily_targets, missing_reason = compute_daily_targets_if_ready(
+            merged_profile, trace_id=trace_id
+        )
+        if daily_targets is not None:
+            physiology = merged_profile.get("physiology") or {}
+            biometrics = physiology.get("biometrics") or {}
+            biometrics["daily_targets"] = daily_targets
+            physiology["biometrics"] = biometrics
+            merged_profile["physiology"] = physiology
+
+            logs = merged_profile.get("logs") or {}
+            current_day = logs.get("current_day") or {}
+            if not isinstance(current_day, dict):
+                current_day = {}
+            current_day["calorie_budget"] = int(daily_targets.get("cals", 0) or 0)
+            logs["current_day"] = current_day
+            merged_profile["logs"] = logs
+        else:
+            log_agent_event(
+                agent="bio_math",
+                stage="targets_not_computed",
+                status=missing_reason or "unknown",
+                trace_id=trace_id,
+            )
+
+        # Keep net deficit synced: (TDEE + active burn) - food eaten.
+        logs = merged_profile.get("logs") or {}
+        current_day = logs.get("current_day") or {}
+        if not isinstance(current_day, dict):
+            current_day = {}
+        physiology = merged_profile.get("physiology") or {}
+        biometrics = physiology.get("biometrics") or {}
+        daily_targets = biometrics.get("daily_targets") or {}
+        tdee_cals = float(daily_targets.get("tdee_cals") or 0)
+        active_cals_burnt = float(current_day.get("active_cals_burnt") or 0)
+        food_cals = float(current_day.get("cals") or 0)
+        current_day["net_deficit"] = calculate_net_deficit(
+            tdee_cals=tdee_cals,
+            active_cals_burnt=active_cals_burnt,
+            food_cals=food_cals,
+        )
+        logs["current_day"] = current_day
+        merged_profile["logs"] = logs
+
         completion_prompt = next_onboarding_prompt(merged_profile)
         if "100% complete" in completion_prompt:
             merged_profile["onboarding_complete"] = True
@@ -334,6 +547,11 @@ async def _process_and_send_twilio_reply(
             .execute()
         )
         print("[Twilio Flow] Living profile update saved to Supabase.")
+        log_agent_event(
+            agent="memory_clerk",
+            stage="profile_saved",
+            trace_id=trace_id,
+        )
 
         refreshed_resp = (
             supabase.table("users")
@@ -363,27 +581,92 @@ async def _process_and_send_twilio_reply(
             .execute()
         )
 
-        coach_started_at = time.perf_counter()
-        coach_reply = await generate_coach_reply(
-            effective_user_text,
-            fresh_profile,
-            session_context={
-                "nutrition_logged_this_turn": nutrition_logged_this_turn,
-                "voice_note_logged_this_turn": voice_note_logged_this_turn,
-                "workout_logged_this_turn": workout_logged_this_turn,
-                "workout_highlight": workout_highlight,
-            },
+        # Missing-data gatekeeper for deterministic macro math.
+        # Memory Clerk runs before this, so if user just shared height/age, gate auto-unlocks.
+        daily_targets_fresh, missing_reason_fresh = compute_daily_targets_if_ready(
+            fresh_profile, trace_id=trace_id
         )
-        coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
-        print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
-        if coach_reply.strip():
-            reply_message = coach_reply.strip()
+        if daily_targets_fresh is None and missing_reason_fresh in {
+            "missing_height_or_age",
+            "missing_gender",
+        }:
+            log_agent_event(
+                agent="intake_agent",
+                stage="math_gate_prompt",
+                status=missing_reason_fresh,
+                trace_id=trace_id,
+            )
+            reply_message = (
+                "Bhai, I need to calculate your exact macros for the December goal. "
+                "What is your height, age, and gender?"
+            )
+        else:
+            coach_started_at = time.perf_counter()
+            coach_reply = await generate_coach_reply(
+                effective_user_text,
+                fresh_profile,
+                session_context={
+                    "nutrition_logged_this_turn": nutrition_logged_this_turn,
+                    "voice_note_logged_this_turn": voice_note_logged_this_turn,
+                    "workout_logged_this_turn": workout_logged_this_turn,
+                    "workout_highlight": workout_highlight,
+                    "activity_burn_logged_this_turn": activity_burn_logged_this_turn,
+                    "activity_burn_added": activity_burn_added,
+                    "activity_assumptions": activity_assumptions[:3],
+                    "routed_intent": routed_intent,
+                    "router_confidence": routed_confidence,
+                    "burn_facts": {
+                        "active_cals_burnt": int(
+                            float(
+                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
+                                    "active_cals_burnt", 0
+                                )
+                                or 0
+                            )
+                        ),
+                        "intake_cals": int(
+                            float(
+                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
+                                    "cals", 0
+                                )
+                                or 0
+                            )
+                        ),
+                        "net_deficit": int(
+                            float(
+                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
+                                    "net_deficit", 0
+                                )
+                                or 0
+                            )
+                        ),
+                    },
+                },
+                trace_id=trace_id,
+            )
+            coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
+            print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
+            if coach_reply.strip():
+                reply_message = coach_reply.strip()
+        log_agent_event(
+            agent="front_desk",
+            stage="pipeline_complete",
+            trace_id=trace_id,
+            details={"reply_chars": len(reply_message)},
+        )
 
     try:
         async with phone_lock:
             await _run_pipeline()
     except Exception as exc:  # noqa: BLE001
         print(f"[Twilio Error] Brain pipeline failed: {exc}")
+        log_agent_event(
+            agent="front_desk",
+            stage="pipeline_error",
+            status="failed",
+            trace_id=trace_id,
+            details={"error": str(exc)},
+        )
         reply_message = (
             "Bhai, AI service abhi thoda busy hai. Tension mat le, 20-30 seconds me "
             "dobara ping kar."
@@ -394,8 +677,21 @@ async def _process_and_send_twilio_reply(
 
     try:
         await send_whatsapp_message(phone_number, reply_message)
+        log_agent_event(
+            agent="front_desk",
+            stage="message_sent",
+            trace_id=trace_id,
+            details={"reply_chars": len(reply_message)},
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"[Twilio Outbound Error] Failed to send final message: {exc}")
+        log_agent_event(
+            agent="front_desk",
+            stage="message_send_error",
+            status="failed",
+            trace_id=trace_id,
+            details={"error": str(exc)},
+        )
 
 
 @router.get("/health")
@@ -452,6 +748,13 @@ async def receive_twilio_webhook(
 
     phone_number = From.removeprefix("whatsapp:").strip()
     incoming_text = (Body or "").strip()
+    trace_id = (MessageSid or "").strip() or f"{phone_number}-{int(time.time() * 1000)}"
+    log_agent_event(
+        agent="front_desk",
+        stage="incoming_event",
+        trace_id=trace_id,
+        details={"has_text": bool(incoming_text), "num_media": NumMedia or "0"},
+    )
     print(f"[Twilio Incoming] {phone_number} says: {incoming_text}")
     media_count = 0
     try:
@@ -524,6 +827,7 @@ async def receive_twilio_webhook(
         incoming_text,
         media_url,
         media_content_type,
+        trace_id,
     )
     print("[Twilio Ack] Responding immediately; processing reply in background.")
     return Response(

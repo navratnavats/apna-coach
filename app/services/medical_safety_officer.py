@@ -9,6 +9,7 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.agent_trace import log_agent_event
 
 
 def _extract_injuries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
@@ -84,17 +85,38 @@ async def run_medical_safety_officer(
     living_profile: dict[str, Any],
     *,
     source: str = "coach_workout",
+    trace_id: str | None = None,
 ) -> str:
     """
     Agent 5 (Medical Safety Officer):
     Intercepts workout output and rewrites unsafe movements before user delivery.
     """
     injuries = _extract_injuries(living_profile)
+    log_agent_event(
+        agent="medical_safety_officer",
+        stage="start",
+        trace_id=trace_id,
+        details={"source": source, "injury_count": len(injuries)},
+    )
     if not injuries:
+        log_agent_event(
+            agent="medical_safety_officer",
+            stage="bypass",
+            status="no_injuries",
+            trace_id=trace_id,
+        )
         return workout_text
 
     if not GEMINI_API_KEY:
-        return _rule_based_rewrite(workout_text, injuries)
+        rewritten = _rule_based_rewrite(workout_text, injuries)
+        log_agent_event(
+            agent="medical_safety_officer",
+            stage="complete",
+            status="rule_based",
+            trace_id=trace_id,
+            details={"rewritten": rewritten != workout_text},
+        )
+        return rewritten
 
     system_prompt = (
         "You are Medical_Safety_Officer for Apna Coach. Your role is purely analytical "
@@ -129,8 +151,30 @@ async def run_medical_safety_officer(
     try:
         reviewed = await asyncio.to_thread(_call_model)
         if reviewed:
+            log_agent_event(
+                agent="medical_safety_officer",
+                stage="complete",
+                status="llm_reviewed",
+                trace_id=trace_id,
+                details={"rewritten": reviewed != workout_text},
+            )
             return reviewed
     except Exception as exc:  # noqa: BLE001
         print(f"[Medical Safety Officer] LLM review failed: {exc}")
+        log_agent_event(
+            agent="medical_safety_officer",
+            stage="error",
+            status="llm_failed",
+            trace_id=trace_id,
+            details={"error": str(exc)},
+        )
 
-    return _rule_based_rewrite(workout_text, injuries)
+    rewritten = _rule_based_rewrite(workout_text, injuries)
+    log_agent_event(
+        agent="medical_safety_officer",
+        stage="complete",
+        status="fallback_rule_based",
+        trace_id=trace_id,
+        details={"rewritten": rewritten != workout_text},
+    )
+    return rewritten

@@ -10,6 +10,8 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.agent_trace import log_agent_event
+from app.services.critic_agent import run_critic_agent
 
 
 def _today_nutrition_entries(
@@ -48,14 +50,24 @@ def _safe_float(value: Any) -> float:
 
 
 async def generate_dietitian_review(
-    living_profile: dict[str, Any], timezone_name: str
+    living_profile: dict[str, Any], timezone_name: str, trace_id: str | None = None
 ) -> str:
     """
     Generate end-of-day concise accountability message from today's nutrition log.
     """
     today_entries = _today_nutrition_entries(living_profile, timezone_name)
+    log_agent_event(
+        agent="dietitian",
+        stage="start",
+        trace_id=trace_id,
+        details={"today_entries": len(today_entries)},
+    )
     if not today_entries:
-        return "Bhai, aaj kuch khaya nahi ya log karna bhool gaye? Aise progress nahi hogi."
+        return await run_critic_agent(
+            "Bhai, aaj kuch khaya nahi ya log karna bhool gaye? Aise progress nahi hogi.",
+            source="dietitian_review",
+            trace_id=trace_id,
+        )
 
     total_calories = sum(_safe_float(e.get("estimated_calories")) for e in today_entries)
     total_protein = sum(
@@ -83,7 +95,11 @@ async def generate_dietitian_review(
             lines.append(
                 "Bhai, aaj ka nutrition theek gaya. Kal logging aur protein consistency pe focus kar."
             )
-        return " ".join(lines)
+        return await run_critic_agent(
+            " ".join(lines),
+            source="dietitian_review",
+            trace_id=trace_id,
+        )
 
     system_prompt = (
         "You are the Dietitian Agent for Apna Coach. Create a concise WhatsApp end-of-day "
@@ -129,13 +145,29 @@ async def generate_dietitian_review(
         text = await asyncio.to_thread(_call_model)
     except Exception as exc:  # noqa: BLE001
         print(f"[Dietitian] LLM review failed: {exc}")
-        return (
+        return await run_critic_agent(
+            (
             "Bhai, quick review: aaj ka logging complete rakha, great. Kal protein thoda "
             "aur consistent rakhte hain aur water target hit karte hain."
+            ),
+            source="dietitian_review",
+            trace_id=trace_id,
         )
 
-    return text or (
+    final = await run_critic_agent(
+        text
+        or (
         "Bhai, aaj ka nutrition review ready hai. Kal se thoda aur disciplined logging "
         "aur protein focus rakhenge."
+        ),
+        source="dietitian_review",
+        trace_id=trace_id,
     )
+    log_agent_event(
+        agent="dietitian",
+        stage="complete",
+        trace_id=trace_id,
+        details={"chars": len(final)},
+    )
+    return final
 

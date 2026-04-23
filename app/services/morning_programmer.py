@@ -8,6 +8,8 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.agent_trace import log_agent_event
+from app.services.critic_agent import run_critic_agent
 from app.services.medical_safety_officer import run_medical_safety_officer
 
 
@@ -19,21 +21,37 @@ def _available_equipment(living_profile: dict[str, Any]) -> list[str]:
     return [str(item).strip().lower() for item in raw if str(item).strip()]
 
 
-async def generate_morning_workout_nudge(living_profile: dict[str, Any]) -> str:
+async def generate_morning_workout_nudge(
+    living_profile: dict[str, Any], trace_id: str | None = None
+) -> str:
     """
     Morning proactive Workout Programmer specialist output.
     """
     equipment = _available_equipment(living_profile)
+    log_agent_event(
+        agent="workout_programmer",
+        stage="morning_start",
+        trace_id=trace_id,
+        details={"equipment_count": len(equipment)},
+    )
     if not equipment:
-        return (
+        return await run_critic_agent(
+            (
             "Subah ho gayi Bhai! Plan banane ko ready hoon, but pehle bata tu kis "
             "setup pe hai - gym access hai ya ghar pe dumbbells/bands/pull-up bar?"
+            ),
+            source="morning_nudge",
+            trace_id=trace_id,
         )
 
     if not GEMINI_API_KEY:
-        return (
+        return await run_critic_agent(
+            (
             "Subah ho gayi Bhai! Aaj 15-min quick hit: 1) Goblet Squat 3x12, "
             "2) Dumbbell Row 3x12/side, 3) Band Face Pull 3x15. Dhyaan se form pe focus kar."
+            ),
+            source="morning_nudge",
+            trace_id=trace_id,
         )
 
     system_prompt = (
@@ -73,9 +91,22 @@ async def generate_morning_workout_nudge(living_profile: dict[str, Any]) -> str:
         "Subah ho gayi Bhai! Aaj 15-min plan ready: 3 exercises, controlled reps, "
         "aur form pe full focus."
     )
-    return await run_medical_safety_officer(
+    safety_reviewed = await run_medical_safety_officer(
         final_text,
         living_profile,
         source="morning_nudge",
+        trace_id=trace_id,
     )
+    final = await run_critic_agent(
+        safety_reviewed,
+        source="morning_nudge",
+        trace_id=trace_id,
+    )
+    log_agent_event(
+        agent="workout_programmer",
+        stage="morning_complete",
+        trace_id=trace_id,
+        details={"chars": len(final)},
+    )
+    return final
 

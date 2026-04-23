@@ -18,6 +18,7 @@ from app.config import (
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
 )
+from app.services.agent_trace import log_agent_event
 
 
 def load_default_living_profile() -> dict[str, Any]:
@@ -65,9 +66,22 @@ async def ai_memory_clerk(
     user_message: str,
     current_profile: dict[str, Any],
     source_hint: str = "text",
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
+    log_agent_event(
+        agent="memory_clerk",
+        stage="start",
+        trace_id=trace_id,
+        details={"source_hint": source_hint, "message_chars": len(user_message or "")},
+    )
     if not GEMINI_API_KEY:
         print("[AI] GEMINI_API_KEY missing; skipping extraction for this message.")
+        log_agent_event(
+            agent="memory_clerk",
+            stage="skipped",
+            status="no_api_key",
+            trace_id=trace_id,
+        )
         return {}
 
     system_prompt = (
@@ -81,7 +95,10 @@ async def ai_memory_clerk(
         "- If injuries are present, return under physiology.injuries as an array "
         "of objects with keys: part, severity, history, pain_triggers.\n"
         "- If weight is present, set physiology.biometrics.weight as number in kg.\n"
+        "- If height is present, set physiology.biometrics.height as number in centimeters.\n"
+        "- If age is present, set physiology.biometrics.age as integer in years.\n"
         "- If name is present, set identity.name.\n"
+        "- If gender is present, set identity.gender (e.g., male/female).\n"
         "- If goal is present, set psychology.core_why.\n"
         "- If user mentions training setup (home/gym/park/travel), set "
         "lifestyle.training_environment.\n"
@@ -108,6 +125,17 @@ async def ai_memory_clerk(
         "- Convert hydration to liters. Assume 1 glass = 0.25 liters.\n"
         "- For hydration updates, return logs.current_day.water_liters_delta as a number "
         "to ADD to existing water value (do not return total replacement).\n"
+        "- Detect activity logging intent (running, walking, gym, swimming, cycling, "
+        "sports like badminton/pickleball/football, etc).\n"
+        "- If activity is logged, return logs.activity_log as array of objects with keys: "
+        "name, category(run|walk|cycling|swimming|strength_training|racquet_sport|team_sport|general_cardio), "
+        "duration_mins, intensity(light|moderate|vigorous), met_score, rest_style(normal|no_rest|long_rest), "
+        "confidence, assumption_note.\n"
+        "- For strength training, if user does not specify rest style, default to rest_style='normal'.\n"
+        "- If user says no rest/continuous workout, set rest_style='no_rest'.\n"
+        "- If user is correcting a just-logged activity intensity/rest (e.g., 'no rest tha'), "
+        "return logs.activity_adjustment object with keys like mode='recalculate_last' and "
+        "rest_style='no_rest' so backend can recompute instead of double-counting.\n"
         "- Never remove existing logs. Return only additive updates.\n"
         "- If information is missing, do not invent it and do not include that key."
     )
@@ -133,6 +161,12 @@ async def ai_memory_clerk(
         print(f"[AI] Response received in {elapsed_ms} ms (chars={len(response_text)})")
         parsed = extract_json_from_model_text(response_text)
         print(f"[AI] Parsed update keys: {sorted(parsed.keys())}")
+        log_agent_event(
+            agent="memory_clerk",
+            stage="complete",
+            trace_id=trace_id,
+            details={"update_keys": sorted(parsed.keys())},
+        )
         return parsed
 
     return await asyncio.to_thread(_call_model)
@@ -151,7 +185,7 @@ def _download_media_bytes(media_url: str) -> bytes:
 
 
 async def ai_nutrition_from_image(
-    image_url: str, current_profile: dict[str, Any]
+    image_url: str, current_profile: dict[str, Any], trace_id: str | None = None
 ) -> dict[str, Any]:
     """
     Brain A vision extension:
@@ -159,7 +193,18 @@ async def ai_nutrition_from_image(
     """
     if not GEMINI_API_KEY:
         print("[AI Vision] GEMINI_API_KEY missing; skipping image nutrition extraction.")
+        log_agent_event(
+            agent="nutritionist",
+            stage="vision_skipped",
+            status="no_api_key",
+            trace_id=trace_id,
+        )
         return {}
+    log_agent_event(
+        agent="nutritionist",
+        stage="vision_start",
+        trace_id=trace_id,
+    )
 
     system_prompt = (
         "You are the Memory Clerk for Apna Coach. Analyze the food image and return "
@@ -203,13 +248,21 @@ async def ai_nutrition_from_image(
         )
         parsed = extract_json_from_model_text(response_text)
         print(f"[AI Vision] Parsed keys: {sorted(parsed.keys())}")
+        log_agent_event(
+            agent="nutritionist",
+            stage="vision_complete",
+            trace_id=trace_id,
+            details={"parsed_keys": sorted(parsed.keys())},
+        )
         return parsed
 
     return await asyncio.to_thread(_call_model)
 
 
 async def ai_transcribe_voice_note(
-    media_url: str, media_content_type: str = "audio/ogg"
+    media_url: str,
+    media_content_type: str = "audio/ogg",
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Brain A audio extension:
@@ -217,7 +270,18 @@ async def ai_transcribe_voice_note(
     """
     if not GEMINI_API_KEY:
         print("[AI Audio] GEMINI_API_KEY missing; skipping voice transcription.")
+        log_agent_event(
+            agent="memory_clerk",
+            stage="voice_transcribe_skipped",
+            status="no_api_key",
+            trace_id=trace_id,
+        )
         return {}
+    log_agent_event(
+        agent="memory_clerk",
+        stage="voice_transcribe_start",
+        trace_id=trace_id,
+    )
 
     system_prompt = (
         "You are the Memory Clerk for Apna Coach. Transcribe the user's voice note "
@@ -253,6 +317,12 @@ async def ai_transcribe_voice_note(
             if len(transcript_preview) > 400:
                 transcript_preview = transcript_preview[:400] + "..."
             print(f"[AI Audio] Transcript: {transcript_preview}")
+        log_agent_event(
+            agent="memory_clerk",
+            stage="voice_transcribe_complete",
+            trace_id=trace_id,
+            details={"has_transcript": bool(transcript_preview)},
+        )
         return parsed
 
     return await asyncio.to_thread(_call_model)

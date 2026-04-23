@@ -9,6 +9,8 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.agent_trace import log_agent_event
+from app.services.critic_agent import run_critic_agent
 from app.services.medical_safety_officer import run_medical_safety_officer
 
 
@@ -23,6 +25,27 @@ def _get_available_equipment(living_profile: dict[str, Any]) -> list[str]:
         if normalized:
             equipment.append(normalized)
     return equipment
+
+
+def _is_burn_or_deficit_query(user_message: str) -> bool:
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    calorie_terms = (
+        "calorie",
+        "calories",
+        "kcal",
+        "burn",
+        "burnt",
+        "deficit",
+        "net",
+    )
+    activity_terms = ("run", "running", "walk", "steps", "swim", "cycling", "workout")
+    question_terms = ("how much", "kitna", "kitni", "today", "aaj")
+    has_calorie_context = any(term in text for term in calorie_terms)
+    has_question = any(term in text for term in question_terms)
+    has_activity_hint = any(term in text for term in activity_terms)
+    return has_calorie_context and (has_question or has_activity_hint)
 
 
 async def _detect_workout_intent(user_message: str) -> bool:
@@ -127,10 +150,21 @@ def _sanitize_coach_reply(reply_text: str) -> str:
     )
 
 
+async def _finalize_with_critic(
+    draft_text: str,
+    *,
+    source: str,
+    trace_id: str | None = None,
+) -> str:
+    polished = await run_critic_agent(draft_text, source=source, trace_id=trace_id)
+    return _sanitize_coach_reply(polished or draft_text)
+
+
 async def generate_coach_reply(
     user_message: str,
     living_profile: dict[str, Any],
     session_context: dict[str, Any] | None = None,
+    trace_id: str | None = None,
 ) -> str:
     """
     Brain B (Coach):
@@ -138,16 +172,44 @@ async def generate_coach_reply(
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing for coach reply generation.")
+    log_agent_event(
+        agent="coach",
+        stage="start",
+        trace_id=trace_id,
+        details={"message_chars": len(user_message or "")},
+    )
 
-    is_workout_request = await _detect_workout_intent(user_message)
+    session = session_context or {}
+    routed_intent = str(session.get("routed_intent") or "").strip().lower()
+    burn_query_routed = routed_intent == "burn_query"
+    burn_query_fallback = _is_burn_or_deficit_query(user_message)
+    is_burn_query = burn_query_routed or burn_query_fallback
+
+    is_workout_request = False
+    if not is_burn_query:
+        is_workout_request = await _detect_workout_intent(user_message)
+    log_agent_event(
+        agent="coach",
+        stage="intent_detected",
+        trace_id=trace_id,
+        details={
+            "is_workout_request": is_workout_request,
+            "is_burn_query": is_burn_query,
+            "routed_intent": routed_intent or "none",
+        },
+    )
     equipment_list = _get_available_equipment(living_profile)
 
     # Gatekeeper logic: collect equipment before workout programming.
     if is_workout_request and len(equipment_list) == 0:
-        return (
+        return await _finalize_with_critic(
+            (
             "Bhai, main solid plan dene ke liye ready hoon, but mujhe pata hi nahi "
             "tu kis setup pe train karta hai. Gym access hai, ya ghar pe dumbbells, "
             "kettlebell, bands, pull-up bar, ya yoga mat hai? Dhyaan se bata."
+            ),
+            source="coach",
+            trace_id=trace_id,
         )
 
     # Specialist handoff: for workout requests with equipment available,
@@ -159,8 +221,13 @@ async def generate_coach_reply(
                 workout_text,
                 living_profile,
                 source="coach_workout",
+                trace_id=trace_id,
             )
-            return _sanitize_coach_reply(reviewed_workout or workout_text)
+            return await _finalize_with_critic(
+                reviewed_workout or workout_text,
+                source="coach_workout",
+                trace_id=trace_id,
+            )
 
     add_reminder = _should_add_motivation_reminder(living_profile)
     reminder_anchor = _motivation_anchor(living_profile)
@@ -193,6 +260,14 @@ async def generate_coach_reply(
         "If session_context.workout_logged_this_turn is true, start with a short "
         "congratulatory line in Bhai tone and acknowledge progression. If "
         "session_context.workout_highlight is non-empty, mention it naturally.\n"
+        "If session_context.activity_burn_logged_this_turn is true, acknowledge "
+        "estimated calories burnt and mention assumptions from "
+        "session_context.activity_assumptions briefly. Tell user they can say "
+        "'no rest/continuous' to recalculate.\n"
+        "If user asks how much calories burned/deficit today, answer using hard "
+        "numbers from logs.current_day.active_cals_burnt and logs.current_day.net_deficit "
+        "(do not guess). Prefer session_context.burn_facts when present and keep "
+        "those numeric values exact.\n"
         + "\n".join(additional_rules)
     )
 
@@ -216,7 +291,15 @@ async def generate_coach_reply(
         reply_text = (response.text or "").strip()
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         print(f"[Coach] Response received in {elapsed_ms} ms (chars={len(reply_text)})")
-        return _sanitize_coach_reply(reply_text)
+        return reply_text
 
-    return await asyncio.to_thread(_call_model)
+    draft_reply = await asyncio.to_thread(_call_model)
+    final = await _finalize_with_critic(draft_reply, source="coach", trace_id=trace_id)
+    log_agent_event(
+        agent="coach",
+        stage="complete",
+        trace_id=trace_id,
+        details={"chars": len(final)},
+    )
+    return final
 
