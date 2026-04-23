@@ -4,7 +4,7 @@
 {
   "identity": {
     "name": "",
-    "preferred_title": "Bhai",
+    "preferred_title": "",
     "language_mix": "Hinglish",
     "audio_preference": "voice_and_text",
     "gender": "",
@@ -27,7 +27,7 @@
     "quit_signals": []
   },
   "lifestyle": {
-    "training_environment": "home",
+    "training_environment": "",
     "available_equipment": [],
     "preferred_workout_time": "",
     "dietary_restrictions": []
@@ -56,6 +56,14 @@
       "pending_change_request": {}
     },
     "change_log": []
+  },
+  "onboarding": {
+    "is_active": true,
+    "pending_fields": [],
+    "last_seen_at": "",
+    "last_updated_at": "",
+    "completed_at": "",
+    "session_expired_at": ""
   }
 }
 ```

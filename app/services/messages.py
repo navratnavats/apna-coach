@@ -1,6 +1,30 @@
 from __future__ import annotations
 
 
+def _onboarding_label_map() -> dict[str, str]:
+    return {
+        "name": "Name",
+        "age": "Age",
+        "height": "Height (cm)",
+        "weight": "Current weight (kg)",
+        "target_weight": "Target weight (kg)",
+        "gender": "Gender",
+        "core_why": "Aapka main reason: kya achieve karna hai, kyun karna hai, aur kab tak karna hai. Voice note chalega.",
+        "injuries": "Koi injury/pain/body related issue like dibates, sprains, HighBloodPressure, etc. hai to body part, pain kitna hai, kis movement me trigger hota hai, aur medicine/dawa ho to batayiye. Nahi hai to 'none'. Voice note chalega.",
+        "equipment": "Aap home pe train karte ho ya gym me? Kaunsa samaan available hai (dumbbells, bands, machine, etc.) batayiye. Voice note chalega.",
+    }
+
+
+def _render_onboarding_fields(fields: list[str]) -> str:
+    label_map = _onboarding_label_map()
+    ordered = []
+    for key in fields:
+        label = label_map.get(key, key)
+        if label not in ordered:
+            ordered.append(label)
+    return "\n".join([f"- {item}" for item in ordered]) if ordered else "- Basic details"
+
+
 def with_address(address: str, body: str) -> str:
     safe_address = (address or "").strip() or "Buddy"
     return f"{safe_address}, {body}"
@@ -70,6 +94,115 @@ def intake_basic_stats(address: str) -> str:
     )
 
 
+def intake_name() -> str:
+    return "Welcome! Start karte hain - aapko kis naam se address karun?"
+
+
+def intake_bulk_details(address: str, missing_fields: list[str]) -> str:
+    asks = _render_onboarding_fields(missing_fields)
+    return (
+        f"{address}, onboarding fast-track karte hain.\n"
+        "Aap ye details ek message me ya multiple chunks me bhej sakte hain:\n"
+        f"{asks}\n"
+        "Agar type karna mushkil ho to voice note bhej dijiye.\n"
+        "Main har message ke baad remaining fields track karta rahunga.\n"
+        "Quick options: 'kya bacha hai / what is left', 'onboarding status', "
+        "'is step ka matlab / what does this step mean', "
+        "'onboarding edit', 'onboarding restart'."
+    )
+
+
+def intake_resume_after_timeout(address: str, missing_fields: list[str]) -> str:
+    line_items = _render_onboarding_fields(missing_fields)
+    return (
+        f"{address}, onboarding session resume karte hain. Koi tension nahi — "
+        f"abhi sirf remaining details chahiye:\n{line_items}\n"
+        "Quick options: 'kya bacha hai / what is left', 'onboarding status', "
+        "'is step ka matlab / what does this step mean', "
+        "'onboarding edit', 'onboarding restart'."
+    )
+
+
+def onboarding_policy_redirect(address: str, pending_fields: list[str]) -> str:
+    pending = _render_onboarding_fields(pending_fields)
+    return (
+        f"{address}, onboarding complete karne ke liye please profile details par hi reply kijiye: "
+        f"\n{pending}\nNormal coaching questions onboarding complete hote hi full start ho jayenge.\n"
+        "Quick options: 'kya bacha hai / what is left', 'onboarding status', "
+        "'is step ka matlab / what does this step mean', "
+        "'onboarding edit', 'onboarding restart'."
+    )
+
+
+def onboarding_restart_done(address: str) -> str:
+    return (
+        f"{address}, onboarding reset kar diya. Chaliye fresh start karte hain.\n"
+        "Aap details ek message me ya chunks me bhej sakte hain."
+    )
+
+
+def onboarding_help(address: str) -> str:
+    return (
+        f"{address}, onboarding quick commands (Hinglish friendly):\n"
+        "- kya bacha hai / what is left\n"
+        "- onboarding status / complete hua?\n"
+        "- is step ka matlab / what does this step mean\n"
+        "- onboarding edit\n"
+        "- onboarding restart\n"
+        "Aap normal text/voice me details bhejoge to main auto-map karta rahunga."
+    )
+
+
+def onboarding_status(address: str, *, is_complete: bool, pending_fields: list[str]) -> str:
+    if is_complete:
+        return f"{address}, onboarding complete hai. Aap full coaching mode me ho. ✅"
+    pending = _render_onboarding_fields(pending_fields)
+    return (
+        f"{address}, onboarding abhi complete nahi hua.\n"
+        f"Remaining fields:\n{pending}\n"
+        "Aap ek-ek karke, chunks me, ya detailed audio me bhej sakte ho."
+    )
+
+
+def onboarding_field_explanations(address: str, pending_fields: list[str]) -> str:
+    explain_map = {
+        "name": "- Name: jis naam se aapko address karna hai.",
+        "age": "- Age: years me.",
+        "height": "- Height: cm me (ft/in bologe to bhi main map kar lunga).",
+        "weight": "- Current weight: abhi ka body weight kg me.",
+        "target_weight": "- Target weight: aap kis weight tak jana chahte ho (kg).",
+        "gender": "- Gender: male/female (sirf calculation accuracy ke liye).",
+        "core_why": "- Core why: aap transformation kyun chahte ho + by when. Example: Dec wedding tak 10kg fat loss.",
+        "injuries": "- Injuries: body part, pain level, kis movement pe trigger hota hai, meds if any.",
+        "equipment": "- Equipment/setup: home/gym + available items (dumbbells, bands, etc).",
+    }
+    lines = [explain_map.get(k) for k in pending_fields if explain_map.get(k)]
+    if not lines:
+        lines = ["- Basic profile details to personalize coaching."]
+    return (
+        f"{address}, is step ka matlab ye hai:\n"
+        + "\n".join(lines)
+        + "\nAap details text ya voice note dono me bhej sakte ho."
+    )
+
+
+def onboarding_edit_help(address: str) -> str:
+    return (
+        f"{address}, bilkul. Aap onboarding fields edit kar sakte hain.\n"
+        "Update format (one per line) use kijiye:\n"
+        "- name: ...\n"
+        "- age: ...\n"
+        "- height: ... cm\n"
+        "- weight: ... kg\n"
+        "- target: ... kg\n"
+        "- gender: male/female\n"
+        "- core why: ...\n"
+        "- injuries: ... (or none)\n"
+        "- equipment: ...\n"
+        "Jo field change karni hai sirf wahi bhejiye."
+    )
+
+
 def intake_confirm_gender(address: str) -> str:
     return with_address(address, "ek cheez confirm kijiye: male ya female?")
 
@@ -80,8 +213,11 @@ def intake_target_weight(address: str) -> str:
 
 def intake_core_why() -> str:
     return (
-        "Solid. Ab batayiye aapka main goal kya hai aur kyun? "
-        "(example: sister wedding tak lean hona, 21km run improve karna)"
+        "Solid. Ab *core why* batayiye — matlab aapki transformation ka real reason.\n"
+        "Format: goal + reason + deadline\n"
+        "Example:\n"
+        "- December me sister wedding hai, 10kg fat loss chahiye\n"
+        "- 21km run complete karna hai within 4 months"
     )
 
 

@@ -47,6 +47,7 @@ ALLOWED_SHAPE: dict[str, Any] = {
         "activity_adjustment": True,
         "coach_message_count": True,
     },
+    "onboarding": True,
     "onboarding_complete": True,
 }
 

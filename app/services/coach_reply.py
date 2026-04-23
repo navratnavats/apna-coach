@@ -34,6 +34,12 @@ def _get_available_equipment(living_profile: dict[str, Any]) -> list[str]:
     return equipment
 
 
+def _get_training_environment(living_profile: dict[str, Any]) -> str:
+    lifestyle = living_profile.get("lifestyle") or {}
+    env = str(lifestyle.get("training_environment") or "").strip().lower()
+    return env
+
+
 def _is_burn_or_deficit_query(user_message: str) -> bool:
     text = str(user_message or "").strip().lower()
     if not text:
@@ -96,6 +102,47 @@ async def _detect_workout_intent(user_message: str) -> bool:
         return await asyncio.to_thread(_call_model)
     except Exception:  # noqa: BLE001
         return False
+
+
+async def _infer_training_environment_from_query(user_message: str) -> tuple[str, str]:
+    """
+    LLM-based environment mapping from user's workout query.
+    Returns (environment, confidence) where environment is one of:
+    home | gym | both | unknown.
+    """
+    if not GEMINI_API_KEY:
+        return ("unknown", "low")
+
+    system_prompt = (
+        "Classify the likely workout training environment from the user's message. "
+        "Return ONLY JSON with keys: environment, confidence.\n"
+        "environment must be one of: home, gym, both, unknown.\n"
+        "confidence must be one of: high, medium, low.\n"
+        "Use unknown when unclear."
+    )
+
+    def _call_model() -> tuple[str, str]:
+        model = genai.GenerativeModel(
+            model_name=GEMINI_COACH_MODEL,
+            system_instruction=system_prompt,
+        )
+        response = model.generate_content(
+            user_message,
+            generation_config={"response_mime_type": "application/json"},
+        )
+        parsed = json.loads((response.text or "{}").strip())
+        env = str(parsed.get("environment") or "unknown").strip().lower()
+        conf = str(parsed.get("confidence") or "low").strip().lower()
+        if env not in {"home", "gym", "both", "unknown"}:
+            env = "unknown"
+        if conf not in {"high", "medium", "low"}:
+            conf = "low"
+        return (env, conf)
+
+    try:
+        return await asyncio.to_thread(_call_model)
+    except Exception:  # noqa: BLE001
+        return ("unknown", "low")
 
 
 async def _generate_workout_program(
@@ -328,6 +375,7 @@ async def generate_coach_reply(
         },
     )
     equipment_list = _get_available_equipment(living_profile)
+    training_env = _get_training_environment(living_profile)
 
     # Gatekeeper logic: collect equipment before workout programming.
     if is_workout_request and len(equipment_list) == 0:
@@ -338,6 +386,37 @@ async def generate_coach_reply(
             source="coach",
             living_profile=living_profile,
             trace_id=trace_id,
+        )
+
+    if is_workout_request and not training_env:
+        inferred_env, inferred_conf = await _infer_training_environment_from_query(user_message)
+        log_agent_event(
+            agent="coach",
+            stage="training_env_inferred",
+            trace_id=trace_id,
+            details={"environment": inferred_env, "confidence": inferred_conf},
+        )
+        if inferred_env not in {"home", "gym", "both"} or inferred_conf == "low":
+            return await _finalize_with_critic(
+                (
+                    f"{address}, workout plan personalize karne ke liye ek quick confirm chahiye: "
+                    "aaj home setup pe train karenge, gym pe, ya dono options chahiye?"
+                ),
+                source="coach",
+                living_profile=living_profile,
+                trace_id=trace_id,
+            )
+
+        lifestyle = living_profile.get("lifestyle")
+        if not isinstance(lifestyle, dict):
+            lifestyle = {}
+            living_profile["lifestyle"] = lifestyle
+        lifestyle["training_environment"] = inferred_env
+        log_agent_event(
+            agent="coach",
+            stage="training_env_inferred_applied",
+            trace_id=trace_id,
+            details={"environment": inferred_env},
         )
 
     # Specialist handoff: for workout requests with equipment available,

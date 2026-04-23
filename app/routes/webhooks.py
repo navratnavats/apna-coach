@@ -42,6 +42,13 @@ from app.services.messages import (
     ack_image,
     ack_long_text,
     image_rejection,
+    onboarding_help,
+    onboarding_field_explanations,
+    onboarding_status,
+    onboarding_policy_redirect,
+    onboarding_edit_help,
+    onboarding_restart_done,
+    intake_resume_after_timeout,
     onboarding_missing_biometrics,
     pipeline_busy_retry,
     policy_out_of_scope,
@@ -52,7 +59,13 @@ from app.services.intake_agent import (
     build_graduation_message,
     build_intake_prompt,
     get_missing_onboarding_fields,
+    ONBOARDING_FIELDS,
+    refresh_onboarding_session_state,
+    reset_onboarding_profile_fields,
+    touch_onboarding_session,
 )
+from app.services.onboarding_policy import evaluate_onboarding_message
+from app.services.persona import resolve_user_address
 from app.services.intent_router import classify_router_intent
 from app.services.critic_agent import run_critic_agent
 from app.services.plan_agent import generate_structured_plan
@@ -87,6 +100,127 @@ _pending_batches: dict[str, dict[str, Any]] = {}
 _batch_flush_tasks: dict[str, asyncio.Task] = {}
 _phone_queues: dict[str, deque[dict[str, Any]]] = {}
 _phone_worker_tasks: dict[str, asyncio.Task] = {}
+
+
+def _detect_onboarding_control_intent(user_message: str) -> str:
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return "none"
+    restart_markers = (
+        "restart onboarding",
+        "reset onboarding",
+        "start onboarding again",
+        "onboarding restart",
+        "onboarding dobara",
+        "onboarding reset",
+        "phirse onboarding",
+    )
+    edit_markers = (
+        "edit onboarding",
+        "update onboarding",
+        "change onboarding",
+        "edit profile",
+        "update profile",
+        "onboarding edit",
+        "profile edit",
+        "details update",
+        "detail update",
+    )
+    status_markers = (
+        "onboarding status",
+        "is onboarding complete",
+        "onboarding complete?",
+        "status of onboarding",
+        "onboarding complete hua",
+        "complete hua kya",
+        "status kya hai",
+    )
+    left_markers = (
+        "what is left",
+        "what's left",
+        "what all is left",
+        "kya bacha",
+        "kya bacha hai",
+        "kya pending hai",
+        "ab kya dena hai",
+        "what remains",
+    )
+    help_markers = (
+        "onboarding help",
+        "help onboarding",
+        "onboarding commands",
+    )
+    explain_markers = (
+        "what does this step mean",
+        "what does this mean",
+        "is step ka matlab",
+        "matlab kya",
+        "explain this step",
+        "ye step kya hai",
+        "yeh step kya hai",
+        "samjha do",
+    )
+    if any(m in text for m in restart_markers):
+        return "restart"
+    if any(m in text for m in edit_markers):
+        return "edit"
+    if any(m in text for m in status_markers):
+        return "status"
+    if any(m in text for m in left_markers):
+        return "left"
+    if any(m in text for m in help_markers):
+        return "help"
+    if any(m in text for m in explain_markers):
+        return "explain"
+    return "none"
+
+
+def _filter_onboarding_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(updates, dict):
+        return {}
+    filtered: dict[str, Any] = {}
+
+    identity = updates.get("identity")
+    if isinstance(identity, dict):
+        ident_filtered: dict[str, Any] = {}
+        for key in ("name", "gender", "preferred_title"):
+            value = identity.get(key)
+            if value not in (None, ""):
+                ident_filtered[key] = value
+        if ident_filtered:
+            filtered["identity"] = ident_filtered
+
+    physiology = updates.get("physiology")
+    if isinstance(physiology, dict):
+        phys_filtered: dict[str, Any] = {}
+        biometrics = physiology.get("biometrics")
+        if isinstance(biometrics, dict):
+            bio_filtered: dict[str, Any] = {}
+            for key in ("age", "height", "weight", "target"):
+                value = biometrics.get(key)
+                if value not in (None, ""):
+                    bio_filtered[key] = value
+            if bio_filtered:
+                phys_filtered["biometrics"] = bio_filtered
+        injuries = physiology.get("injuries")
+        if isinstance(injuries, list):
+            phys_filtered["injuries"] = injuries
+        if phys_filtered:
+            filtered["physiology"] = phys_filtered
+
+    psychology = updates.get("psychology")
+    if isinstance(psychology, dict):
+        core_why = psychology.get("core_why")
+        if core_why not in (None, ""):
+            filtered["psychology"] = {"core_why": core_why}
+
+    lifestyle = updates.get("lifestyle")
+    if isinstance(lifestyle, dict):
+        equipment = lifestyle.get("available_equipment")
+        if isinstance(equipment, list):
+            filtered["lifestyle"] = {"available_equipment": equipment}
+
+    return filtered
 
 
 def _safe_twiml_message(text: str) -> str:
@@ -246,30 +380,6 @@ async def _process_and_send_twilio_reply(
                 "source_event_ids": source_event_ids,
             },
         )
-        quota_result = consume_daily_turn_quota(
-            phone_number=phone_number,
-            timezone_name=SCHEDULER_TIMEZONE,
-            daily_limit=TRIAL_DAILY_TURN_LIMIT,
-            warning_threshold=TRIAL_DAILY_TURN_WARNING_THRESHOLD,
-        )
-        log_agent_event(
-            agent="quota_gate",
-            stage="consumed_turn",
-            trace_id=trace_id,
-            details={
-                "used_turns": int(quota_result.get("used_turns") or 0),
-                "limit": int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
-                "blocked": bool(quota_result.get("blocked")),
-            },
-        )
-        if bool(quota_result.get("blocked")):
-            reply_message = trial_limit_wall(daily_limit=TRIAL_DAILY_TURN_LIMIT)
-            return
-        if bool(quota_result.get("warn")):
-            quota_warning_suffix = trial_limit_warning(
-                used_turns=int(quota_result.get("used_turns") or 0),
-                daily_limit=int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
-            )
         existing_user_resp = (
             supabase.table("users")
             .select("id, living_profile")
@@ -292,6 +402,39 @@ async def _process_and_send_twilio_reply(
         else:
             base_profile = existing_rows[0].get("living_profile") or {}
         onboarding_was_complete = bool(base_profile.get("onboarding_complete") is True)
+
+        if onboarding_was_complete:
+            quota_result = consume_daily_turn_quota(
+                phone_number=phone_number,
+                timezone_name=SCHEDULER_TIMEZONE,
+                daily_limit=TRIAL_DAILY_TURN_LIMIT,
+                warning_threshold=TRIAL_DAILY_TURN_WARNING_THRESHOLD,
+            )
+            log_agent_event(
+                agent="quota_gate",
+                stage="consumed_turn",
+                trace_id=trace_id,
+                details={
+                    "used_turns": int(quota_result.get("used_turns") or 0),
+                    "limit": int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
+                    "blocked": bool(quota_result.get("blocked")),
+                },
+            )
+            if bool(quota_result.get("blocked")):
+                reply_message = trial_limit_wall(daily_limit=TRIAL_DAILY_TURN_LIMIT)
+                return
+            if bool(quota_result.get("warn")):
+                quota_warning_suffix = trial_limit_warning(
+                    used_turns=int(quota_result.get("used_turns") or 0),
+                    daily_limit=int(quota_result.get("daily_limit") or TRIAL_DAILY_TURN_LIMIT),
+                )
+        else:
+            log_agent_event(
+                agent="quota_gate",
+                stage="skipped",
+                trace_id=trace_id,
+                details={"reason": "onboarding_incomplete"},
+            )
 
         effective_user_text = body
         voice_note_logged_this_turn = False
@@ -329,47 +472,149 @@ async def _process_and_send_twilio_reply(
                 else f"{effective_user_text}\n\nVoice note transcript: {merged_transcript}"
             )
 
-        policy_result = await classify_query_policy(
-            user_message=effective_user_text,
-            has_media=bool(media_items),
+        merged_profile = ensure_plan_state(base_profile)
+        merged_profile, missing_before_turn, onboarding_session_expired = refresh_onboarding_session_state(
+            merged_profile
         )
-        policy_decision = str(policy_result.get("decision") or "allow")
-        policy_reason = str(policy_result.get("reason") or "normal")
-        policy_forced_mode = str(policy_result.get("forced_mode") or "push")
-        log_agent_event(
-            agent="policy_gate",
-            stage="applied",
-            trace_id=trace_id,
-            details={
-                "decision": policy_decision,
-                "reason": policy_reason,
-                "confidence": str(policy_result.get("confidence") or "low"),
-            },
-        )
-        if policy_decision == "deny":
-            reply_message = str(policy_result.get("safe_response_hint") or "").strip() or (
-                policy_out_of_scope()
+        onboarding_fast_lane = len(missing_before_turn) > 0
+        onboarding_control_intent = _detect_onboarding_control_intent(effective_user_text)
+        if onboarding_control_intent == "help":
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_help(address)
+            return
+        if onboarding_control_intent in {"status", "left"}:
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_status(
+                address,
+                is_complete=not onboarding_fast_lane,
+                pending_fields=missing_before_turn,
             )
             return
+        if onboarding_control_intent == "explain":
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_field_explanations(address, missing_before_turn)
+            return
+        if onboarding_control_intent == "restart":
+            merged_profile = reset_onboarding_profile_fields(merged_profile)
+            merged_profile = touch_onboarding_session(
+                merged_profile,
+                missing_fields=ONBOARDING_FIELDS,
+            )
+            (
+                supabase.table("users")
+                .update({"living_profile": merged_profile})
+                .eq("phone_number", phone_number)
+                .execute()
+            )
+            log_agent_event(
+                agent="intake_agent",
+                stage="onboarding_restarted",
+                trace_id=trace_id,
+            )
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_restart_done(address)
+            return
+        if onboarding_control_intent == "edit" and not onboarding_fast_lane:
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_edit_help(address)
+            return
 
-        router_result = await classify_router_intent(
-            effective_user_text,
-            trace_id=trace_id,
-        )
-        routed_intent = str(router_result.get("primary_intent") or "general_chat")
-        routed_confidence = str(router_result.get("confidence") or "low")
-        plan_fallback_intent = classify_plan_intent_fallback(effective_user_text)
-        if plan_fallback_intent:
-            routed_intent = plan_fallback_intent
-            routed_confidence = "fallback"
-        log_agent_event(
-            agent="router",
-            stage="applied",
-            trace_id=trace_id,
-            details={"intent": routed_intent, "confidence": routed_confidence},
-        )
+        policy_decision = "allow"
+        policy_reason = "normal"
+        policy_forced_mode = "push"
+        routed_intent = "general_chat"
+        routed_confidence = "low"
+        if onboarding_fast_lane:
+            if onboarding_control_intent == "edit":
+                merged_profile = touch_onboarding_session(
+                    merged_profile,
+                    missing_fields=ONBOARDING_FIELDS,
+                )
+                (
+                    supabase.table("users")
+                    .update({"living_profile": merged_profile})
+                    .eq("phone_number", phone_number)
+                    .execute()
+                )
+                log_agent_event(
+                    agent="intake_agent",
+                    stage="onboarding_edit_mode",
+                    trace_id=trace_id,
+                )
+                address = resolve_user_address(merged_profile)
+                reply_message = onboarding_edit_help(address)
+                return
+            onboarding_policy = evaluate_onboarding_message(
+                user_message=effective_user_text,
+                pending_fields=missing_before_turn,
+                has_media=bool(media_items),
+            )
+            onboarding_policy_decision = str(onboarding_policy.get("decision") or "allow")
+            policy_reason = "onboarding_fast_lane"
+            policy_forced_mode = "support"
+            routed_intent = "profile_update"
+            routed_confidence = "fast_lane"
+            log_agent_event(
+                agent="policy_gate",
+                stage="onboarding_applied",
+                trace_id=trace_id,
+                details={
+                    "reason": str(onboarding_policy.get("reason") or "onboarding_fast_lane"),
+                    "decision": onboarding_policy_decision,
+                    "pending_fields": missing_before_turn,
+                },
+            )
+            if onboarding_policy_decision != "allow":
+                address = resolve_user_address(merged_profile)
+                reply_message = onboarding_policy_redirect(address, missing_before_turn)
+                return
+            log_agent_event(
+                agent="router",
+                stage="skipped",
+                trace_id=trace_id,
+                details={"intent": routed_intent, "confidence": routed_confidence},
+            )
+        else:
+            policy_result = await classify_query_policy(
+                user_message=effective_user_text,
+                has_media=bool(media_items),
+            )
+            policy_decision = str(policy_result.get("decision") or "allow")
+            policy_reason = str(policy_result.get("reason") or "normal")
+            policy_forced_mode = str(policy_result.get("forced_mode") or "push")
+            log_agent_event(
+                agent="policy_gate",
+                stage="applied",
+                trace_id=trace_id,
+                details={
+                    "decision": policy_decision,
+                    "reason": policy_reason,
+                    "confidence": str(policy_result.get("confidence") or "low"),
+                },
+            )
+            if policy_decision == "deny":
+                reply_message = str(policy_result.get("safe_response_hint") or "").strip() or (
+                    policy_out_of_scope()
+                )
+                return
 
-        merged_profile = ensure_plan_state(base_profile)
+            router_result = await classify_router_intent(
+                effective_user_text,
+                trace_id=trace_id,
+            )
+            routed_intent = str(router_result.get("primary_intent") or "general_chat")
+            routed_confidence = str(router_result.get("confidence") or "low")
+            plan_fallback_intent = classify_plan_intent_fallback(effective_user_text)
+            if plan_fallback_intent:
+                routed_intent = plan_fallback_intent
+                routed_confidence = "fallback"
+            log_agent_event(
+                agent="router",
+                stage="applied",
+                trace_id=trace_id,
+                details={"intent": routed_intent, "confidence": routed_confidence},
+            )
+
         merged_profile, plan_confirmation = apply_plan_confirmation_if_any(
             merged_profile,
             effective_user_text,
@@ -404,7 +649,7 @@ async def _process_and_send_twilio_reply(
 
         memory_started_at = time.perf_counter()
         extracted_updates: dict[str, Any] = {}
-        if routed_intent not in {"burn_query", *PLAN_INTENTS}:
+        if routed_intent != "burn_query":
             extracted_updates = await ai_memory_clerk(
                 effective_user_text,
                 merged_profile,
@@ -415,6 +660,14 @@ async def _process_and_send_twilio_reply(
                 extracted_updates,
                 trace_id=trace_id,
             )
+            if routed_intent in PLAN_INTENTS:
+                extracted_updates = _filter_onboarding_updates(extracted_updates)
+                log_agent_event(
+                    agent="memory_clerk",
+                    stage="onboarding_only_filter_applied",
+                    trace_id=trace_id,
+                    details={"routed_intent": routed_intent},
+                )
         else:
             log_agent_event(
                 agent="memory_clerk",
@@ -765,14 +1018,27 @@ async def _process_and_send_twilio_reply(
         logs["current_day"] = current_day
         merged_profile["logs"] = logs
 
-        # Psychology Agent: nuanced signal extraction + deterministic bounded update.
-        psych_analysis = await analyze_psychology_signals(
-            user_message=effective_user_text,
-            living_profile=merged_profile,
-        )
-        merged_profile = apply_psychology_update(merged_profile, psych_analysis)
+        psych_analysis: dict[str, Any] = {}
+        # Psychology analysis is deferred during onboarding fast-lane to cut latency.
+        if onboarding_fast_lane:
+            log_agent_event(
+                agent="psychology_agent",
+                stage="skipped",
+                trace_id=trace_id,
+                details={"reason": "onboarding_fast_lane"},
+            )
+        else:
+            psych_analysis = await analyze_psychology_signals(
+                user_message=effective_user_text,
+                living_profile=merged_profile,
+            )
+            merged_profile = apply_psychology_update(merged_profile, psych_analysis)
 
         missing_after_merge = get_missing_onboarding_fields(merged_profile)
+        merged_profile = touch_onboarding_session(
+            merged_profile,
+            missing_fields=missing_after_merge,
+        )
         if not missing_after_merge:
             merged_profile["onboarding_complete"] = True
 
@@ -833,7 +1099,11 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
                 details={"missing_fields": missing_onboarding_now},
             )
-            reply_message = build_intake_prompt(fresh_profile, missing_onboarding_now)
+            if onboarding_session_expired:
+                address = resolve_user_address(fresh_profile)
+                reply_message = intake_resume_after_timeout(address, missing_onboarding_now)
+            else:
+                reply_message = build_intake_prompt(fresh_profile, missing_onboarding_now)
         elif (
             not onboarding_was_complete
             and onboarding_is_complete
@@ -902,6 +1172,9 @@ async def _process_and_send_twilio_reply(
                         active["constraints"] = plan_payload.get("constraints") or {}
                     plans["active"] = active
                     fresh_profile["plans"] = plans
+            env_before = str(
+                ((fresh_profile.get("lifestyle") or {}).get("training_environment") or "")
+            ).strip().lower()
             coach_started_at = time.perf_counter()
             coach_reply = await generate_coach_reply(
                 effective_user_text,
@@ -943,6 +1216,22 @@ async def _process_and_send_twilio_reply(
                 },
                 trace_id=trace_id,
             )
+            env_after = str(
+                ((fresh_profile.get("lifestyle") or {}).get("training_environment") or "")
+            ).strip().lower()
+            if env_after and env_after != env_before:
+                (
+                    supabase.table("users")
+                    .update({"living_profile": fresh_profile})
+                    .eq("phone_number", phone_number)
+                    .execute()
+                )
+                log_agent_event(
+                    agent="memory_clerk",
+                    stage="training_env_persisted",
+                    trace_id=trace_id,
+                    details={"environment": env_after},
+                )
             coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
             if coach_reply.strip():
                 reply_message = coach_reply.strip()

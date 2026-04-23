@@ -17,5 +17,5 @@ def resolve_user_address(living_profile: dict[str, Any]) -> str:
     if name:
         return name
 
-    return "Buddy"
+    return "Friend"
 
