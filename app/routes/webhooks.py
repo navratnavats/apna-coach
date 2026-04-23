@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Query, Request, Response, status
@@ -14,6 +15,7 @@ from app.services.coach_reply import generate_coach_reply
 from app.services.memory_clerk import (
     ai_memory_clerk,
     ai_nutrition_from_image,
+    ai_transcribe_voice_note,
     deep_merge_profile,
     load_default_living_profile,
     next_onboarding_prompt,
@@ -45,7 +47,10 @@ def _cleanup_recent_events(now_ts: float) -> None:
 
 
 async def _process_and_send_twilio_reply(
-    phone_number: str, body: str, media_url: Optional[str] = None
+    phone_number: str,
+    body: str,
+    media_url: Optional[str] = None,
+    media_content_type: Optional[str] = None,
 ) -> None:
     request_started_at = time.perf_counter()
     reply_message = "Bhai, give me a second, optimizing your plan..."
@@ -75,17 +80,73 @@ async def _process_and_send_twilio_reply(
         else:
             base_profile = existing_rows[0].get("living_profile") or {}
 
+        effective_user_text = body
+        voice_note_logged_this_turn = False
+        source_hint = "text"
+
+        if media_url and (media_content_type or "").lower().startswith("audio/"):
+            audio_result = await ai_transcribe_voice_note(
+                media_url, media_content_type or "audio/ogg"
+            )
+            transcript = str(audio_result.get("transcript") or "").strip()
+            if transcript:
+                voice_note_logged_this_turn = True
+                source_hint = "voice"
+                effective_user_text = (
+                    transcript
+                    if not effective_user_text
+                    else f"{effective_user_text}\n\nVoice note transcript: {transcript}"
+                )
+                print("[Twilio Flow] Voice note transcribed and added to user context.")
+
         memory_started_at = time.perf_counter()
-        extracted_updates = await ai_memory_clerk(body, base_profile)
+        extracted_updates = await ai_memory_clerk(
+            effective_user_text, base_profile, source_hint=source_hint
+        )
         memory_elapsed_ms = int((time.perf_counter() - memory_started_at) * 1000)
         print(f"[Twilio Timing] Memory clerk completed in {memory_elapsed_ms} ms")
         print(
             f"[Twilio Flow] Extracted updates: {json.dumps(extracted_updates, ensure_ascii=False)}"
         )
+        extracted_logs = extracted_updates.get("logs")
+        extracted_nutrition_entries: list[dict[str, Any]] = []
+        if isinstance(extracted_logs, dict):
+            raw_nutrition = extracted_logs.get("nutrition_log")
+            if isinstance(raw_nutrition, list):
+                for entry in raw_nutrition:
+                    if isinstance(entry, dict):
+                        extracted_nutrition_entries.append(entry)
+            elif isinstance(raw_nutrition, dict):
+                extracted_nutrition_entries.append(raw_nutrition)
+
+            # Prevent array overwrite in deep merge; we'll append manually.
+            extracted_logs = dict(extracted_logs)
+            extracted_logs.pop("nutrition_log", None)
+            extracted_updates["logs"] = extracted_logs
+
         merged_profile = deep_merge_profile(base_profile, extracted_updates)
         nutrition_logged_this_turn = False
 
-        if media_url:
+        if extracted_nutrition_entries:
+            logs = merged_profile.get("logs") or {}
+            nutrition_log = logs.get("nutrition_log") or []
+            if not isinstance(nutrition_log, list):
+                nutrition_log = []
+            for entry in extracted_nutrition_entries:
+                entry.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
+                entry.setdefault("source", source_hint)
+                if body:
+                    entry.setdefault("user_message", body)
+                nutrition_log.append(entry)
+            logs["nutrition_log"] = nutrition_log
+            merged_profile["logs"] = logs
+            nutrition_logged_this_turn = True
+            print(
+                f"[Twilio Flow] Nutrition entries appended from {source_hint}: "
+                f"{len(extracted_nutrition_entries)}"
+            )
+
+        if media_url and (media_content_type or "").lower().startswith("image/"):
             vision_updates = await ai_nutrition_from_image(media_url, merged_profile)
             food_log_entry = vision_updates.get("food_log_entry")
             if isinstance(food_log_entry, dict):
@@ -94,6 +155,11 @@ async def _process_and_send_twilio_reply(
                 if not isinstance(nutrition_log, list):
                     nutrition_log = []
                 nutrition_log.append(food_log_entry)
+                food_log_entry.setdefault(
+                    "logged_at", datetime.now(timezone.utc).isoformat()
+                )
+                if body:
+                    food_log_entry.setdefault("user_message", body)
                 logs["nutrition_log"] = nutrition_log
                 merged_profile["logs"] = logs
                 nutrition_logged_this_turn = True
@@ -141,9 +207,12 @@ async def _process_and_send_twilio_reply(
 
         coach_started_at = time.perf_counter()
         coach_reply = await generate_coach_reply(
-            body,
+            effective_user_text,
             fresh_profile,
-            session_context={"nutrition_logged_this_turn": nutrition_logged_this_turn},
+            session_context={
+                "nutrition_logged_this_turn": nutrition_logged_this_turn,
+                "voice_note_logged_this_turn": voice_note_logged_this_turn,
+            },
         )
         coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
         print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
@@ -210,6 +279,7 @@ async def receive_twilio_webhook(
     Body: Optional[str] = Form(None),
     NumMedia: Optional[str] = Form(None),
     MediaUrl0: Optional[str] = Form(None),
+    MediaContentType0: Optional[str] = Form(None),
     MessageStatus: Optional[str] = Form(None),
     SmsStatus: Optional[str] = Form(None),
     MessageSid: Optional[str] = Form(None),
@@ -229,8 +299,12 @@ async def receive_twilio_webhook(
     except (TypeError, ValueError):
         media_count = 0
     media_url = MediaUrl0 if media_count > 0 and MediaUrl0 else None
+    media_content_type = MediaContentType0 if media_count > 0 and MediaContentType0 else None
     if media_url:
-        print(f"[Twilio Incoming] Media detected. MediaUrl0 present for {phone_number}.")
+        print(
+            f"[Twilio Incoming] Media detected. MediaUrl0 present for {phone_number}. "
+            f"content_type={media_content_type or 'unknown'}"
+        )
 
     # Guard 1: status callbacks are not user chat messages.
     # IMPORTANT: inbound user events may carry SmsStatus=received, so do not drop
@@ -268,7 +342,10 @@ async def receive_twilio_webhook(
     # Guard 4: dedupe near-identical repeated events/retries.
     now_ts = time.time()
     _cleanup_recent_events(now_ts)
-    event_key = f"{phone_number}|{incoming_text}|{media_url or ''}|{MessageSid or ''}"
+    event_key = (
+        f"{phone_number}|{incoming_text}|{media_url or ''}|"
+        f"{media_content_type or ''}|{MessageSid or ''}"
+    )
     if event_key in _recent_twilio_events:
         print(f"[Twilio Event] type=duplicate from={phone_number}")
         return Response(
@@ -282,7 +359,11 @@ async def receive_twilio_webhook(
     )
 
     background_tasks.add_task(
-        _process_and_send_twilio_reply, phone_number, incoming_text, media_url
+        _process_and_send_twilio_reply,
+        phone_number,
+        incoming_text,
+        media_url,
+        media_content_type,
     )
     print("[Twilio Ack] Responding immediately; processing reply in background.")
     return Response(

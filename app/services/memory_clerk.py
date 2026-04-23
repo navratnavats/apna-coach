@@ -61,7 +61,11 @@ def extract_json_from_model_text(text: str) -> dict[str, Any]:
     return parsed
 
 
-async def ai_memory_clerk(user_message: str, current_profile: dict[str, Any]) -> dict[str, Any]:
+async def ai_memory_clerk(
+    user_message: str,
+    current_profile: dict[str, Any],
+    source_hint: str = "text",
+) -> dict[str, Any]:
     if not GEMINI_API_KEY:
         print("[AI] GEMINI_API_KEY missing; skipping extraction for this message.")
         return {}
@@ -85,12 +89,20 @@ async def ai_memory_clerk(user_message: str, current_profile: dict[str, Any]) ->
         "pull-up bar, yoga mat, barbell, treadmill, full gym, etc), save as "
         "lifestyle.available_equipment string array.\n"
         "- Normalize equipment names into concise lowercase tokens.\n"
+        "- Detect Food Logging Intent from text/transcript (e.g., 'khaya', 'ate', "
+        "'breakfast/lunch/dinner', meal names like Butter Chicken, Dal Makhani, Poha).\n"
+        "- If food logging intent is present, estimate calories/macros and return under "
+        "logs.nutrition_log as an array with one or more entries.\n"
+        "- Each nutrition entry must include: source, summary, estimated_calories, "
+        "estimated_macros(protein_g, carbs_g, fat_g), confidence.\n"
+        "- For source, use source_hint exactly if it is 'text' or 'voice'.\n"
         "- If information is missing, do not invent it and do not include that key."
     )
 
     model_input = {
         "current_profile": current_profile,
         "user_message": user_message,
+        "source_hint": source_hint,
     }
 
     def _call_model() -> dict[str, Any]:
@@ -113,8 +125,8 @@ async def ai_memory_clerk(user_message: str, current_profile: dict[str, Any]) ->
     return await asyncio.to_thread(_call_model)
 
 
-def _download_image_bytes(image_url: str) -> bytes:
-    request = urllib.request.Request(image_url, method="GET")
+def _download_media_bytes(media_url: str) -> bytes:
+    request = urllib.request.Request(media_url, method="GET")
     # Twilio media URLs may require account auth.
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         credentials = f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")
@@ -155,7 +167,7 @@ async def ai_nutrition_from_image(
     def _call_model() -> dict[str, Any]:
         started_at = time.perf_counter()
         print(f"[AI Vision] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
-        image_bytes = _download_image_bytes(image_url)
+        image_bytes = _download_media_bytes(image_url)
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL_3_1_FLASH,
             system_instruction=system_prompt,
@@ -178,6 +190,56 @@ async def ai_nutrition_from_image(
         )
         parsed = extract_json_from_model_text(response_text)
         print(f"[AI Vision] Parsed keys: {sorted(parsed.keys())}")
+        return parsed
+
+    return await asyncio.to_thread(_call_model)
+
+
+async def ai_transcribe_voice_note(
+    media_url: str, media_content_type: str = "audio/ogg"
+) -> dict[str, Any]:
+    """
+    Brain A audio extension:
+    Transcribe WhatsApp voice note media into text for downstream brains.
+    """
+    if not GEMINI_API_KEY:
+        print("[AI Audio] GEMINI_API_KEY missing; skipping voice transcription.")
+        return {}
+
+    system_prompt = (
+        "You are the Memory Clerk for Apna Coach. Transcribe the user's voice note "
+        "accurately and return ONLY JSON in this format:\n"
+        '{ "transcript": "..." }\n'
+        "No markdown. No extra keys unless needed."
+    )
+
+    def _call_model() -> dict[str, Any]:
+        started_at = time.perf_counter()
+        print(f"[AI Audio] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
+        audio_bytes = _download_media_bytes(media_url)
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL_3_1_FLASH,
+            system_instruction=system_prompt,
+        )
+        response = model.generate_content(
+            [
+                {"mime_type": media_content_type, "data": audio_bytes},
+            ],
+            generation_config={"response_mime_type": "application/json"},
+        )
+        response_text = response.text or "{}"
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        print(
+            f"[AI Audio] Response received in {elapsed_ms} ms "
+            f"(chars={len(response_text)})"
+        )
+        parsed = extract_json_from_model_text(response_text)
+        print(f"[AI Audio] Parsed keys: {sorted(parsed.keys())}")
+        transcript_preview = str(parsed.get("transcript") or "").strip()
+        if transcript_preview:
+            if len(transcript_preview) > 400:
+                transcript_preview = transcript_preview[:400] + "..."
+            print(f"[AI Audio] Transcript: {transcript_preview}")
         return parsed
 
     return await asyncio.to_thread(_call_model)

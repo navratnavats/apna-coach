@@ -43,3 +43,16 @@ CHECKIN_MESSAGE: str = os.getenv(
     "Bhai, this is an automated check-in. Have you worked out today?",
 )
 
+# Nightly Dietitian review settings.
+DIETITIAN_REVIEW_ENABLED: bool = (
+    os.getenv("DIETITIAN_REVIEW_ENABLED", "true").lower() == "true"
+)
+DIETITIAN_REVIEW_HOUR: int = int(os.getenv("DIETITIAN_REVIEW_HOUR", "21"))
+DIETITIAN_REVIEW_MINUTE: int = int(os.getenv("DIETITIAN_REVIEW_MINUTE", "30"))
+SCHEDULER_TIMEZONE: str = os.getenv("SCHEDULER_TIMEZONE", "Asia/Kolkata")
+
+# Morning Workout Nudge settings.
+MORNING_NUDGE_ENABLED: bool = os.getenv("MORNING_NUDGE_ENABLED", "true").lower() == "true"
+MORNING_NUDGE_HOUR: int = int(os.getenv("MORNING_NUDGE_HOUR", "8"))
+MORNING_NUDGE_MINUTE: int = int(os.getenv("MORNING_NUDGE_MINUTE", "0"))
+

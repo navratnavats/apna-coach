@@ -182,6 +182,8 @@ async def generate_coach_reply(
         "markdown, just clean text.\n\n"
         "If session_context.nutrition_logged_this_turn is true, acknowledge that food "
         "has been logged before giving coaching advice.\n"
+        "If session_context.voice_note_logged_this_turn is true, briefly acknowledge "
+        "that you processed their voice note before coaching response.\n"
         + "\n".join(additional_rules)
     )
 
