@@ -79,6 +79,12 @@ async def ai_memory_clerk(user_message: str, current_profile: dict[str, Any]) ->
         "- If weight is present, set physiology.biometrics.weight as number in kg.\n"
         "- If name is present, set identity.name.\n"
         "- If goal is present, set psychology.core_why.\n"
+        "- If user mentions training setup (home/gym/park/travel), set "
+        "lifestyle.training_environment.\n"
+        "- If user mentions equipment (dumbbells, kettlebell, resistance band, "
+        "pull-up bar, yoga mat, barbell, treadmill, full gym, etc), save as "
+        "lifestyle.available_equipment string array.\n"
+        "- Normalize equipment names into concise lowercase tokens.\n"
         "- If information is missing, do not invent it and do not include that key."
     )
 

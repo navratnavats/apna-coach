@@ -24,8 +24,6 @@ router = APIRouter()
 RECENT_EVENT_TTL_SECONDS = 45
 _recent_twilio_events: dict[str, float] = {}
 _phone_locks: dict[str, asyncio.Lock] = {}
-AI_STAGE_TIMEOUT_SECONDS = 25
-TOTAL_PIPELINE_TIMEOUT_SECONDS = 600
 OUTBOUND_STATUS_VALUES = {"sent", "delivered", "read", "failed", "undelivered"}
 
 
@@ -78,10 +76,7 @@ async def _process_and_send_twilio_reply(
             base_profile = existing_rows[0].get("living_profile") or {}
 
         memory_started_at = time.perf_counter()
-        extracted_updates = await asyncio.wait_for(
-            ai_memory_clerk(body, base_profile),
-            timeout=AI_STAGE_TIMEOUT_SECONDS,
-        )
+        extracted_updates = await ai_memory_clerk(body, base_profile)
         memory_elapsed_ms = int((time.perf_counter() - memory_started_at) * 1000)
         print(f"[Twilio Timing] Memory clerk completed in {memory_elapsed_ms} ms")
         print(
@@ -91,10 +86,7 @@ async def _process_and_send_twilio_reply(
         nutrition_logged_this_turn = False
 
         if media_url:
-            vision_updates = await asyncio.wait_for(
-                ai_nutrition_from_image(media_url, merged_profile),
-                timeout=AI_STAGE_TIMEOUT_SECONDS,
-            )
+            vision_updates = await ai_nutrition_from_image(media_url, merged_profile)
             food_log_entry = vision_updates.get("food_log_entry")
             if isinstance(food_log_entry, dict):
                 logs = merged_profile.get("logs") or {}
@@ -148,13 +140,10 @@ async def _process_and_send_twilio_reply(
         )
 
         coach_started_at = time.perf_counter()
-        coach_reply = await asyncio.wait_for(
-            generate_coach_reply(
-                body,
-                fresh_profile,
-                session_context={"nutrition_logged_this_turn": nutrition_logged_this_turn},
-            ),
-            timeout=AI_STAGE_TIMEOUT_SECONDS,
+        coach_reply = await generate_coach_reply(
+            body,
+            fresh_profile,
+            session_context={"nutrition_logged_this_turn": nutrition_logged_this_turn},
         )
         coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
         print(f"[Twilio Timing] Coach reply completed in {coach_elapsed_ms} ms")
@@ -163,16 +152,7 @@ async def _process_and_send_twilio_reply(
 
     try:
         async with phone_lock:
-            await asyncio.wait_for(
-                _run_pipeline(),
-                timeout=TOTAL_PIPELINE_TIMEOUT_SECONDS,
-            )
-    except asyncio.TimeoutError:
-        print(f"[Twilio Error] Pipeline timeout for {phone_number}")
-        reply_message = (
-            "Bhai, thoda load zyada tha. Tension mat le, retry kar raha hoon. "
-            "Please send the message once again."
-        )
+            await _run_pipeline()
     except Exception as exc:  # noqa: BLE001
         print(f"[Twilio Error] Brain pipeline failed: {exc}")
         reply_message = (
