@@ -8,6 +8,7 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.medical_safety_officer import run_medical_safety_officer
 
 
 def _available_equipment(living_profile: dict[str, Any]) -> list[str]:
@@ -63,13 +64,18 @@ async def generate_morning_workout_nudge(living_profile: dict[str, Any]) -> str:
         text = await asyncio.to_thread(_call_model)
     except Exception as exc:  # noqa: BLE001
         print(f"[Morning Programmer] LLM generation failed: {exc}")
-        return (
+        text = (
             "Subah ho gayi Bhai! Aaj 15-min quick hit: 1) DB Romanian Deadlift 3x10, "
             "2) Resistance Band Row 3x12, 3) Glute Bridge 3x15. Injury-safe pace me kar."
         )
 
-    return text or (
+    final_text = text or (
         "Subah ho gayi Bhai! Aaj 15-min plan ready: 3 exercises, controlled reps, "
         "aur form pe full focus."
+    )
+    return await run_medical_safety_officer(
+        final_text,
+        living_profile,
+        source="morning_nudge",
     )
 

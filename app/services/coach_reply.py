@@ -9,6 +9,7 @@ import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.medical_safety_officer import run_medical_safety_officer
 
 
 def _get_available_equipment(living_profile: dict[str, Any]) -> list[str]:
@@ -154,7 +155,12 @@ async def generate_coach_reply(
     if is_workout_request:
         workout_text = await _generate_workout_program(user_message, living_profile)
         if workout_text.strip():
-            return _sanitize_coach_reply(workout_text)
+            reviewed_workout = await run_medical_safety_officer(
+                workout_text,
+                living_profile,
+                source="coach_workout",
+            )
+            return _sanitize_coach_reply(reviewed_workout or workout_text)
 
     add_reminder = _should_add_motivation_reminder(living_profile)
     reminder_anchor = _motivation_anchor(living_profile)
@@ -184,6 +190,9 @@ async def generate_coach_reply(
         "has been logged before giving coaching advice.\n"
         "If session_context.voice_note_logged_this_turn is true, briefly acknowledge "
         "that you processed their voice note before coaching response.\n"
+        "If session_context.workout_logged_this_turn is true, start with a short "
+        "congratulatory line in Bhai tone and acknowledge progression. If "
+        "session_context.workout_highlight is non-empty, mention it naturally.\n"
         + "\n".join(additional_rules)
     )
 

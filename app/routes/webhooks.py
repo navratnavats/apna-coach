@@ -46,6 +46,40 @@ def _cleanup_recent_events(now_ts: float) -> None:
         _recent_twilio_events.pop(key, None)
 
 
+def _is_same_utc_day(iso_ts: str, now_utc: datetime) -> bool:
+    try:
+        parsed = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed_utc = parsed.astimezone(timezone.utc)
+        return parsed_utc.date() == now_utc.date()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _recalculate_current_day_calories(logs: dict[str, Any]) -> int:
+    nutrition_log = logs.get("nutrition_log") or []
+    if not isinstance(nutrition_log, list):
+        return 0
+
+    now_utc = datetime.now(timezone.utc)
+    total = 0.0
+    for entry in nutrition_log:
+        if not isinstance(entry, dict):
+            continue
+
+        logged_at = str(entry.get("logged_at") or "").strip()
+        if logged_at and not _is_same_utc_day(logged_at, now_utc):
+            continue
+
+        try:
+            total += float(entry.get("estimated_calories", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+    return int(round(total))
+
+
 async def _process_and_send_twilio_reply(
     phone_number: str,
     body: str,
@@ -110,6 +144,10 @@ async def _process_and_send_twilio_reply(
         )
         extracted_logs = extracted_updates.get("logs")
         extracted_nutrition_entries: list[dict[str, Any]] = []
+        extracted_workout_summaries: list[dict[str, Any]] = []
+        extracted_volume_trends: list[dict[str, Any]] = []
+        extracted_workout_complete: Optional[bool] = None
+        extracted_water_delta_liters: Optional[float] = None
         if isinstance(extracted_logs, dict):
             raw_nutrition = extracted_logs.get("nutrition_log")
             if isinstance(raw_nutrition, list):
@@ -119,13 +157,61 @@ async def _process_and_send_twilio_reply(
             elif isinstance(raw_nutrition, dict):
                 extracted_nutrition_entries.append(raw_nutrition)
 
+            raw_workout_summaries = extracted_logs.get("last_3_workout_summaries")
+            if isinstance(raw_workout_summaries, list):
+                for entry in raw_workout_summaries:
+                    if isinstance(entry, dict):
+                        extracted_workout_summaries.append(entry)
+            elif isinstance(raw_workout_summaries, dict):
+                extracted_workout_summaries.append(raw_workout_summaries)
+
+            raw_volume_trends = extracted_logs.get("volume_trends")
+            if isinstance(raw_volume_trends, list):
+                for entry in raw_volume_trends:
+                    if isinstance(entry, dict):
+                        extracted_volume_trends.append(entry)
+            elif isinstance(raw_volume_trends, dict):
+                extracted_volume_trends.append(raw_volume_trends)
+
+            raw_current_day = extracted_logs.get("current_day")
+            if isinstance(raw_current_day, dict):
+                if "workout_complete" in raw_current_day:
+                    extracted_workout_complete = bool(raw_current_day.get("workout_complete"))
+                if "water_liters_delta" in raw_current_day:
+                    try:
+                        extracted_water_delta_liters = float(
+                            raw_current_day.get("water_liters_delta") or 0
+                        )
+                    except (TypeError, ValueError):
+                        extracted_water_delta_liters = None
+
             # Prevent array overwrite in deep merge; we'll append manually.
             extracted_logs = dict(extracted_logs)
             extracted_logs.pop("nutrition_log", None)
+            extracted_logs.pop("last_3_workout_summaries", None)
+            extracted_logs.pop("volume_trends", None)
+            if isinstance(extracted_logs.get("current_day"), dict):
+                extracted_logs["current_day"] = dict(extracted_logs["current_day"])
+                extracted_logs["current_day"].pop("workout_complete", None)
+                extracted_logs["current_day"].pop("water_liters_delta", None)
+                if not extracted_logs["current_day"]:
+                    extracted_logs.pop("current_day", None)
             extracted_updates["logs"] = extracted_logs
 
         merged_profile = deep_merge_profile(base_profile, extracted_updates)
         nutrition_logged_this_turn = False
+        workout_logged_this_turn = False
+        workout_highlight = ""
+        has_image_media = bool(
+            media_url and (media_content_type or "").lower().startswith("image/")
+        )
+
+        # If image is present, trust vision model for food logging and skip text/voice food placeholders.
+        if has_image_media and extracted_nutrition_entries:
+            print(
+                "[Twilio Flow] Skipping text/voice nutrition extraction because image is present."
+            )
+            extracted_nutrition_entries = []
 
         if extracted_nutrition_entries:
             logs = merged_profile.get("logs") or {}
@@ -146,7 +232,7 @@ async def _process_and_send_twilio_reply(
                 f"{len(extracted_nutrition_entries)}"
             )
 
-        if media_url and (media_content_type or "").lower().startswith("image/"):
+        if has_image_media:
             vision_updates = await ai_nutrition_from_image(media_url, merged_profile)
             food_log_entry = vision_updates.get("food_log_entry")
             if isinstance(food_log_entry, dict):
@@ -164,6 +250,78 @@ async def _process_and_send_twilio_reply(
                 merged_profile["logs"] = logs
                 nutrition_logged_this_turn = True
                 print("[Twilio Flow] Nutrition entry appended from image.")
+
+        if (
+            extracted_workout_complete is True
+            or extracted_workout_summaries
+            or extracted_volume_trends
+        ):
+            logs = merged_profile.get("logs") or {}
+            current_day = logs.get("current_day") or {}
+            if not isinstance(current_day, dict):
+                current_day = {}
+            if extracted_workout_complete is True:
+                current_day["workout_complete"] = True
+                workout_logged_this_turn = True
+
+            summaries = logs.get("last_3_workout_summaries") or []
+            if not isinstance(summaries, list):
+                summaries = []
+            for summary in extracted_workout_summaries:
+                summary = dict(summary)
+                summary.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
+                summary.setdefault("source", source_hint)
+                summaries.append(summary)
+                workout_logged_this_turn = True
+            if len(summaries) > 3:
+                summaries = summaries[-3:]
+
+            volume_trends = logs.get("volume_trends") or []
+            if not isinstance(volume_trends, list):
+                volume_trends = []
+            for trend in extracted_volume_trends:
+                trend = dict(trend)
+                trend.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
+                trend.setdefault("source", source_hint)
+                volume_trends.append(trend)
+                workout_logged_this_turn = True
+
+            logs["current_day"] = current_day
+            logs["last_3_workout_summaries"] = summaries
+            logs["volume_trends"] = volume_trends
+            merged_profile["logs"] = logs
+
+            # Coach-friendly short highlight from latest parsed workout.
+            latest_summary = summaries[-1] if summaries else {}
+            if isinstance(latest_summary, dict):
+                summary_text = str(latest_summary.get("summary") or "").strip()
+                top_weight = latest_summary.get("top_weight_kg")
+                if summary_text and top_weight not in (None, "", 0, 0.0):
+                    workout_highlight = f"{summary_text} at {top_weight}kg"
+                elif summary_text:
+                    workout_highlight = summary_text
+
+        if extracted_water_delta_liters and extracted_water_delta_liters > 0:
+            logs = merged_profile.get("logs") or {}
+            current_day = logs.get("current_day") or {}
+            if not isinstance(current_day, dict):
+                current_day = {}
+            try:
+                existing_water = float(current_day.get("water", 0) or 0)
+            except (TypeError, ValueError):
+                existing_water = 0.0
+            current_day["water"] = round(existing_water + extracted_water_delta_liters, 3)
+            logs["current_day"] = current_day
+            merged_profile["logs"] = logs
+
+        # Keep current_day calories in sync with today's nutrition log entries.
+        logs = merged_profile.get("logs") or {}
+        current_day = logs.get("current_day") or {}
+        if not isinstance(current_day, dict):
+            current_day = {}
+        current_day["cals"] = _recalculate_current_day_calories(logs)
+        logs["current_day"] = current_day
+        merged_profile["logs"] = logs
 
         completion_prompt = next_onboarding_prompt(merged_profile)
         if "100% complete" in completion_prompt:
@@ -212,6 +370,8 @@ async def _process_and_send_twilio_reply(
             session_context={
                 "nutrition_logged_this_turn": nutrition_logged_this_turn,
                 "voice_note_logged_this_turn": voice_note_logged_this_turn,
+                "workout_logged_this_turn": workout_logged_this_turn,
+                "workout_highlight": workout_highlight,
             },
         )
         coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
