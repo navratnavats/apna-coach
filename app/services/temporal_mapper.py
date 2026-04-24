@@ -44,18 +44,37 @@ def infer_user_timezone(living_profile: dict[str, Any], phone_number: str) -> tu
     return "Asia/Kolkata", "default"
 
 
-def _explicit_meal_slot(text: str) -> str | None:
+def _explicit_meal_slots(text: str) -> list[str]:
     lowered = str(text or "").strip().lower()
+    if not lowered:
+        return []
+    matched: list[tuple[int, str]] = []
     for slot, terms in MEAL_SLOT_TERMS.items():
-        if any(term in lowered for term in terms):
-            return slot
+        last_pos = -1
+        for term in terms:
+            pos = lowered.rfind(term)
+            if pos > last_pos:
+                last_pos = pos
+        if last_pos >= 0:
+            matched.append((last_pos, slot))
+    matched.sort(key=lambda item: item[0])
+    return [slot for _, slot in matched]
+
+
+def _explicit_meal_slot(text: str) -> str | None:
+    slots = _explicit_meal_slots(text)
+    if slots:
+        return slots[-1]
     return None
 
 
 def infer_meal_slot(*, message_text: str, summary: str, local_dt: datetime) -> tuple[str, str]:
-    explicit = _explicit_meal_slot(message_text) or _explicit_meal_slot(summary)
-    if explicit:
-        return explicit, "explicit_user_time"
+    summary_explicit = _explicit_meal_slot(summary)
+    if summary_explicit:
+        return summary_explicit, "explicit_user_time"
+    message_slots = _explicit_meal_slots(message_text)
+    if len(message_slots) == 1:
+        return message_slots[0], "explicit_user_time"
     hour = local_dt.hour
     if 5 <= hour < 10:
         return "breakfast", "message_time_inferred"

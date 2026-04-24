@@ -336,7 +336,10 @@ async def ai_nutrition_from_image(
             system_instruction=system_prompt,
         )
         response = model.generate_content(
-            [{"mime_type": "image/jpeg", "data": image_bytes}, payload],
+            [
+                {"mime_type": "image/jpeg", "data": image_bytes},
+                json.dumps(payload, ensure_ascii=False),
+            ],
             generation_config={"response_mime_type": "application/json"},
         )
         raw = extract_json_from_model_text(response.text or "{}")

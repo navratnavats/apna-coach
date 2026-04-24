@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 
 from app.clients.supabase_client import supabase
 from app.config import (
+    GEMINI_API_KEY,
+    GEMINI_COACH_MODEL,
     SCHEDULER_TIMEZONE,
     TRIAL_DAILY_TURN_LIMIT,
     TRIAL_DAILY_TURN_WARNING_THRESHOLD,
@@ -86,17 +88,37 @@ from app.services.unknown_query_agent import (
     build_unknown_intent_contract,
     should_trigger_unknown_query_clarifier,
 )
-from app.services.critic_agent import run_critic_agent
 from app.services.plan_agent import generate_structured_plan
 from app.services.plan_orchestrator import (
     PLAN_INTENTS,
     apply_plan_confirmation_if_any,
+    build_plan_intake_questionnaire,
     build_plan_compact_for_prompt,
     classify_plan_intent_fallback,
     ensure_plan_state,
     fetch_latest_plan_version,
+    has_sufficient_plan_structure,
+    has_rolling_valid_structure,
+    has_full_week_day_coverage,
+    infer_detailed_day_limit,
+    infer_goal_anchor,
+    infer_required_training_days_per_week,
     infer_plan_type_and_horizon,
+    is_full_plan_view_request,
+    is_today_diet_request,
+    is_today_plan_request,
+    extract_requested_day_number,
+    append_plan_execution_note,
+    get_latest_plan_execution_note,
+    pause_active_plan,
     persist_plan_version,
+    render_today_plan_view,
+    render_today_diet_vs_actual,
+    render_rolling_day_request,
+    render_plan_view,
+    resume_active_plan,
+    resolve_latest_partial_completion_reason,
+    should_render_plan_now,
     upsert_pending_change_request,
 )
 from app.services.policy_agent import classify_query_policy
@@ -112,6 +134,7 @@ from app.services.temporal_intent_agent import parse_temporal_intent, should_inv
 from app.services.twilio_messaging import send_whatsapp_message
 from app.services.usage_quota import consume_daily_turn_quota
 from app.services.observability_async import enqueue_operation_metric
+from app.services.llm_contract_runner import run_json_contract
 
 router = APIRouter()
 RECENT_EVENT_TTL_SECONDS = 45
@@ -124,6 +147,7 @@ _batch_flush_tasks: dict[str, asyncio.Task] = {}
 _phone_queues: dict[str, deque[dict[str, Any]]] = {}
 _phone_worker_tasks: dict[str, asyncio.Task] = {}
 USER_PROFILE_CACHE_TTL_SECONDS = 45
+PLAN_REQUEST_COOLDOWN_SECONDS = 60
 
 
 def _filter_onboarding_updates(updates: dict[str, Any]) -> dict[str, Any]:
@@ -364,6 +388,216 @@ def _merge_image_food_entries(entries: list[dict[str, Any]]) -> list[dict[str, A
     return [merged]
 
 
+async def _filter_text_nutrition_with_llm(
+    *,
+    user_message: str,
+    text_entries: list[dict[str, Any]],
+    has_image_media: bool,
+    trace_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if not has_image_media or not text_entries or not GEMINI_API_KEY:
+        return text_entries
+
+    system_prompt = (
+        "You are Nutrition Fusion Classifier for Apna Coach.\n"
+        "Goal: decide which text nutrition entries should be kept when an image meal is also present in same turn.\n"
+        "Return ONLY JSON with schema:\n"
+        "{"
+        "\"decisions\":[{\"index\":0,\"action\":\"keep|drop\",\"reason\":\"short_reason\"}]"
+        "}\n"
+        "Rules:\n"
+        "- Drop generic text placeholders likely duplicating image meal (e.g., summary only 'breakfast', 'meal', no concrete food item).\n"
+        "- Keep specific additive text items (e.g., '2 eggs', '2 katori daal chawal', named foods/quantities).\n"
+        "- If unsure, keep.\n"
+        "- Provide one decision per index in input order.\n"
+    )
+
+    def _validate(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        decisions = raw.get("decisions")
+        if not isinstance(decisions, list):
+            raise ValueError("missing_decisions")
+        normalized: list[dict[str, Any]] = []
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            try:
+                idx = int(d.get("index"))
+            except (TypeError, ValueError):
+                continue
+            action = str(d.get("action") or "").strip().lower()
+            if action not in {"keep", "drop"}:
+                continue
+            normalized.append({"index": idx, "action": action})
+        return normalized
+
+    try:
+        decisions = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={
+                "user_message": user_message,
+                "has_image_media": has_image_media,
+                "text_entries": text_entries,
+            },
+            max_retries=3,
+            validator=_validate,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_agent_event(
+            agent="nutritionist",
+            stage="fusion_failed",
+            status="warn",
+            trace_id=trace_id,
+            details={"reason": str(exc)[:200]},
+        )
+        return text_entries
+
+    decision_map = {int(d["index"]): str(d["action"]) for d in decisions}
+    filtered: list[dict[str, Any]] = []
+    dropped = 0
+    for idx, entry in enumerate(text_entries):
+        if decision_map.get(idx) == "drop":
+            dropped += 1
+            continue
+        filtered.append(entry)
+    if dropped:
+        log_agent_event(
+            agent="nutritionist",
+            stage="fusion_applied",
+            trace_id=trace_id,
+            details={"dropped_text_entries": dropped, "kept_text_entries": len(filtered)},
+        )
+    return filtered
+
+
+async def _classify_plan_runtime_update(
+    *,
+    user_message: str,
+    plan_context: dict[str, Any],
+) -> dict[str, Any]:
+    text = str(user_message or "").strip()
+    if not text or not GEMINI_API_KEY:
+        return {"action": "none"}
+
+    system_prompt = (
+        "You are Plan Runtime Intent Classifier for Apna Coach.\n"
+        "Classify user message into ONE action for existing plan execution updates.\n"
+        "Return ONLY JSON:\n"
+        "{"
+        "\"action\":\"none|adherence_swap|pause_plan|resume_plan|partial_completion\","
+        "\"expected_item\":\"\","
+        "\"performed_item\":\"\","
+        "\"planned_value\":\"\","
+        "\"actual_value\":\"\","
+        "\"unit\":\"\","
+        "\"reason\":\"\","
+        "\"ask_why\":false,"
+        "\"suggest_plan_adjust\":false"
+        "}\n"
+        "Rules:\n"
+        "- adherence_swap: user says planned X but did Y (workout OR meal).\n"
+        "- partial_completion: user completed less/more than planned (e.g. planned 5km, did 3km).\n"
+        "- pause_plan: vacation/travel/illness/break request.\n"
+        "- resume_plan: user asks to continue/resume/restart paused plan.\n"
+        "- For partial_completion set ask_why=true.\n"
+        "- For repeated underperformance or constraint mention, suggest_plan_adjust=true.\n"
+        "- If uncertain return action=none."
+    )
+
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
+        action = str(raw.get("action") or "none").strip().lower()
+        allowed = {"none", "adherence_swap", "pause_plan", "resume_plan", "partial_completion"}
+        if action not in allowed:
+            action = "none"
+        return {
+            "action": action,
+            "expected_item": str(raw.get("expected_item") or "").strip(),
+            "performed_item": str(raw.get("performed_item") or "").strip(),
+            "planned_value": str(raw.get("planned_value") or "").strip(),
+            "actual_value": str(raw.get("actual_value") or "").strip(),
+            "unit": str(raw.get("unit") or "").strip(),
+            "reason": str(raw.get("reason") or "").strip(),
+            "ask_why": bool(raw.get("ask_why")),
+            "suggest_plan_adjust": bool(raw.get("suggest_plan_adjust")),
+        }
+
+    try:
+        return await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": text, "plan_context": plan_context},
+            max_retries=3,
+            validator=_validate,
+        )
+    except Exception:
+        return {"action": "none"}
+
+
+async def _analyze_partial_completion_why(
+    *,
+    user_message: str,
+    recent_partial_note: dict[str, Any] | None,
+    plan_context: dict[str, Any],
+) -> dict[str, Any]:
+    text = str(user_message or "").strip()
+    if not text or not GEMINI_API_KEY or not isinstance(recent_partial_note, dict):
+        return {"is_reason_followup": False}
+    system_prompt = (
+        "You are Why Analyzer for plan adherence.\n"
+        "Determine whether user message explains WHY for recent partial completion.\n"
+        "Return ONLY JSON:\n"
+        "{"
+        "\"is_reason_followup\":false,"
+        "\"reason_bucket\":\"time|sleep_recovery|pain_injury|energy_nutrition|stress_work|weather|unknown\","
+        "\"confidence\":\"low|medium|high\","
+        "\"recommend_adjustment\":false,"
+        "\"suggested_window_days\":3,"
+        "\"coach_note\":\"short note\""
+        "}\n"
+        "Rules:\n"
+        "- recommend_adjustment=true for likely repeating constraints.\n"
+        "- suggested_window_days must be 3..7.\n"
+        "- If not a reason follow-up, set is_reason_followup=false."
+    )
+
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
+        bucket = str(raw.get("reason_bucket") or "unknown").strip().lower()
+        allowed = {"time", "sleep_recovery", "pain_injury", "energy_nutrition", "stress_work", "weather", "unknown"}
+        if bucket not in allowed:
+            bucket = "unknown"
+        conf = str(raw.get("confidence") or "low").strip().lower()
+        if conf not in {"low", "medium", "high"}:
+            conf = "low"
+        try:
+            days = int(float(raw.get("suggested_window_days") or 3))
+        except (TypeError, ValueError):
+            days = 3
+        days = max(3, min(7, days))
+        return {
+            "is_reason_followup": bool(raw.get("is_reason_followup")),
+            "reason_bucket": bucket,
+            "confidence": conf,
+            "recommend_adjustment": bool(raw.get("recommend_adjustment")),
+            "suggested_window_days": days,
+            "coach_note": str(raw.get("coach_note") or "").strip(),
+        }
+
+    try:
+        return await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={
+                "user_message": text,
+                "recent_partial_note": recent_partial_note,
+                "plan_context": plan_context,
+            },
+            max_retries=3,
+            validator=_validate,
+        )
+    except Exception:
+        return {"is_reason_followup": False}
+
+
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -562,7 +796,7 @@ async def _process_and_send_twilio_reply(
     source_event_ids: list[str] | None = None,
 ) -> None:
     request_started_at = time.perf_counter()
-    reply_message = "Give me a second, optimizing your plan..."
+    reply_message = ""
     quota_warning_suffix = ""
     llm_calls_estimate = 0
     routed_intent = "general_chat"
@@ -911,6 +1145,17 @@ async def _process_and_send_twilio_reply(
                     "intent_source": intent_source,
                 },
             )
+            # Full-plan view requests should be treated as status recall, not new generation.
+            if is_full_plan_view_request(effective_user_text):
+                routed_intent = "plan_status_query"
+                routed_confidence = "forced"
+                intent_source = "full_view_override"
+                log_agent_event(
+                    agent="router",
+                    stage="full_view_override",
+                    trace_id=trace_id,
+                    details={"intent": routed_intent},
+                )
 
         merged_profile, plan_confirmation = apply_plan_confirmation_if_any(
             merged_profile,
@@ -1094,6 +1339,12 @@ async def _process_and_send_twilio_reply(
                     "[Twilio Flow] Dropped low-confidence text/voice food placeholders because image is present."
                 )
             extracted_nutrition_entries = filtered_nutrition_entries
+            extracted_nutrition_entries = await _filter_text_nutrition_with_llm(
+                user_message=effective_user_text,
+                text_entries=extracted_nutrition_entries,
+                has_image_media=has_image_media,
+                trace_id=trace_id,
+            )
 
         if extracted_nutrition_entries:
             logs = merged_profile.get("logs") or {}
@@ -1595,137 +1846,523 @@ async def _process_and_send_twilio_reply(
                     "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
                 )
         else:
-            latest_plan = None
-            if routed_intent in PLAN_INTENTS:
-                latest_plan = fetch_latest_plan_version(phone_number)
-                if latest_plan:
-                    plan_payload = latest_plan.get("plan_payload") or {}
-                    plans = (fresh_profile.get("plans") or {})
-                    active = (plans.get("active") or {})
-                    active["plan_id"] = latest_plan.get("plan_id") or active.get("plan_id")
-                    active["version"] = int(float(latest_plan.get("version") or 0))
-                    active["status"] = latest_plan.get("status") or "active"
-                    if isinstance(plan_payload, dict):
-                        active["type"] = str(
-                            plan_payload.get("type")
-                            or ((plan_payload.get("meta") or {}).get("type") or "hybrid")
+            latest_plan = fetch_latest_plan_version(phone_number)
+            if latest_plan:
+                plan_payload = latest_plan.get("plan_payload") or {}
+                plans = (fresh_profile.get("plans") or {})
+                active = (plans.get("active") or {})
+                active["plan_id"] = latest_plan.get("plan_id") or active.get("plan_id")
+                active["version"] = int(float(latest_plan.get("version") or 0))
+                active["status"] = latest_plan.get("status") or "active"
+                if isinstance(plan_payload, dict):
+                    active["type"] = str(
+                        plan_payload.get("type")
+                        or ((plan_payload.get("meta") or {}).get("type") or "hybrid")
+                    )
+                    active["horizon"] = str(
+                        plan_payload.get("horizon")
+                        or ((plan_payload.get("meta") or {}).get("horizon") or "weekly")
+                    )
+                    active["current_block"] = plan_payload.get("current_block") or {}
+                    active["week_blocks"] = plan_payload.get("week_blocks") or []
+                    active["day_actions"] = plan_payload.get("day_actions") or []
+                    active["constraints"] = plan_payload.get("constraints") or {}
+                plans["active"] = active
+                fresh_profile["plans"] = plans
+                if routed_intent == "plan_status_query":
+                    show_full = is_full_plan_view_request(effective_user_text) or should_render_plan_now(
+                        effective_user_text
+                    )
+                    requested_day = extract_requested_day_number(effective_user_text)
+                    if requested_day is not None and requested_day >= 1:
+                        reply_message = render_rolling_day_request(plan_payload, requested_day)
+                    elif is_today_plan_request(effective_user_text):
+                        tz_name = str(
+                            ((fresh_profile.get("identity") or {}).get("timezone") or "Asia/Kolkata")
+                        ).strip() or "Asia/Kolkata"
+                        try:
+                            local_now = datetime.now(ZoneInfo(tz_name))
+                            day_name = local_now.strftime("%a")
+                            today_iso = local_now.strftime("%Y-%m-%d")
+                        except Exception:
+                            day_name = "Mon"
+                            today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+                        if is_today_diet_request(effective_user_text):
+                            reply_message = render_today_diet_vs_actual(
+                                plan_payload,
+                                fresh_profile,
+                                day_name=day_name,
+                                today_iso=today_iso,
+                            )
+                        else:
+                            reply_message = render_today_plan_view(plan_payload, day_name=day_name)
+                    else:
+                        reply_message = render_plan_view(plan_payload, show_full=show_full)
+            elif routed_intent == "plan_status_query":
+                reply_message = (
+                    "Abhi active plan nahi mila. Bolo to main aapke goal ke hisaab se fresh plan draft kar du."
+                )
+
+            if latest_plan and not reply_message:
+                llm_calls_estimate += 1
+                runtime_update = await _classify_plan_runtime_update(
+                    user_message=effective_user_text,
+                    plan_context=build_plan_compact_for_prompt(fresh_profile),
+                )
+                action = str((runtime_update or {}).get("action") or "none").strip().lower()
+                if action == "adherence_swap":
+                    expected_item = str((runtime_update or {}).get("expected_item") or "").strip()
+                    performed_item = str((runtime_update or {}).get("performed_item") or "").strip()
+                    note = f"Planned: {expected_item or 'NA'} | Done: {performed_item or 'NA'}"
+                    fresh_profile = append_plan_execution_note(
+                        fresh_profile,
+                        note_type="adherence_swap",
+                        note_text=note,
+                        payload={"runtime_update": runtime_update},
+                    )
+                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                    reply_message = (
+                        f"No worries, note kar liya. Aaj planned '{expected_item or 'session'}' ki jagah "
+                        f"'{performed_item or 'updated session'}' kiya."
+                    )
+                elif action == "pause_plan":
+                    reason = str((runtime_update or {}).get("reason") or "temporary break").strip()
+                    fresh_profile = pause_active_plan(fresh_profile, reason)
+                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                    reply_message = "Plan hold kar diya. Jab ready ho, 'resume plan' bolo - wahi se continue karenge."
+                elif action == "resume_plan":
+                    fresh_profile, paused_meta = resume_active_plan(fresh_profile)
+                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                    active_now = ((fresh_profile.get("plans") or {}).get("active") or {})
+                    current_block = (active_now.get("current_block") or {}).get("summary_text") or "last saved block"
+                    pause_reason = str((paused_meta or {}).get("reason") or "").strip()
+                    if pause_reason:
+                        reply_message = (
+                            f"Welcome back. Plan resume ho gaya. Aap '{pause_reason}' break pe the. "
+                            f"Hum '{current_block}' se continue karte hain."
                         )
-                        active["horizon"] = str(
-                            plan_payload.get("horizon")
-                            or ((plan_payload.get("meta") or {}).get("horizon") or "weekly")
+                    else:
+                        reply_message = (
+                            f"Welcome back. Plan resume ho gaya. Hum '{current_block}' se continue karte hain."
                         )
-                        active["current_block"] = plan_payload.get("current_block") or {}
-                        active["week_blocks"] = plan_payload.get("week_blocks") or []
-                        active["day_actions"] = plan_payload.get("day_actions") or []
-                        active["constraints"] = plan_payload.get("constraints") or {}
-                    plans["active"] = active
-                    fresh_profile["plans"] = plans
+                elif action == "partial_completion":
+                    planned_value = str((runtime_update or {}).get("planned_value") or "").strip()
+                    actual_value = str((runtime_update or {}).get("actual_value") or "").strip()
+                    unit = str((runtime_update or {}).get("unit") or "").strip()
+                    fresh_profile = append_plan_execution_note(
+                        fresh_profile,
+                        note_type="partial_completion",
+                        note_text=f"Planned {planned_value} {unit}, completed {actual_value} {unit}",
+                        payload={"runtime_update": runtime_update},
+                    )
+                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                    suggest_adjust = bool((runtime_update or {}).get("suggest_plan_adjust"))
+                    base = (
+                        f"No problem, log kar liya: planned {planned_value or 'target'} {unit}, "
+                        f"actual {actual_value or 'done'} {unit}."
+                    )
+                    follow = " Koi specific reason tha? (sleep, energy, time, pain, weather)"
+                    if suggest_adjust:
+                        follow += " Agar chaho to plan ko thoda adjust kar deta hu based on this."
+                    reply_message = (base + follow).strip()
+                elif action == "none":
+                    recent_partial = get_latest_plan_execution_note(
+                        fresh_profile, note_type="partial_completion"
+                    )
+                    llm_calls_estimate += 1
+                    why_analysis = await _analyze_partial_completion_why(
+                        user_message=effective_user_text,
+                        recent_partial_note=recent_partial,
+                        plan_context=build_plan_compact_for_prompt(fresh_profile),
+                    )
+                    if bool((why_analysis or {}).get("is_reason_followup")):
+                        note = str((why_analysis or {}).get("coach_note") or "").strip()
+                        recommend_adjust = bool((why_analysis or {}).get("recommend_adjustment"))
+                        window_days = int((why_analysis or {}).get("suggested_window_days") or 3)
+                        summary = (
+                            f"{(why_analysis or {}).get('reason_bucket', 'unknown')} "
+                            f"({(why_analysis or {}).get('confidence', 'low')})"
+                        )
+                        fresh_profile = resolve_latest_partial_completion_reason(
+                            fresh_profile,
+                            why_summary=summary,
+                            recommend_adjustment=recommend_adjust,
+                            suggested_window_days=window_days,
+                        )
+                        if recommend_adjust:
+                            fresh_profile = upsert_pending_change_request(
+                                fresh_profile,
+                                f"Adherence reason detected: {summary}. Request 3-7 day micro-adjustment.",
+                            )
+                        fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                        if recommend_adjust:
+                            reply_message = (
+                                f"Samajh gaya. {note or 'Reason noted.'} "
+                                f"Main next {window_days} days ke liye thoda realistic adjustment suggest kar sakta hu. "
+                                "Kar du? (Yes/No)"
+                            )
+                        else:
+                            reply_message = (
+                                f"Samajh gaya. {note or 'Reason noted.'} "
+                                "Abhi plan continue rakhte hain, kal ka session thoda smart pacing se karenge."
+                            )
             env_before = str(
                 ((fresh_profile.get("lifestyle") or {}).get("training_environment") or "")
             ).strip().lower()
-            coach_started_at = time.perf_counter()
-            llm_calls_estimate += 1
-            coach_reply = await generate_coach_reply(
-                effective_user_text,
-                fresh_profile,
-                session_context={
-                    "nutrition_logged_this_turn": nutrition_logged_this_turn,
-                    "voice_note_logged_this_turn": voice_note_logged_this_turn,
-                    "workout_logged_this_turn": workout_logged_this_turn,
-                    "workout_highlight": workout_highlight,
-                    "activity_burn_logged_this_turn": activity_burn_logged_this_turn,
-                    "activity_burn_added": activity_burn_added,
-                    "activity_assumptions": activity_assumptions[:3],
-                    "routed_intent": routed_intent,
-                    "router_confidence": routed_confidence,
-                    "intent_source": (
-                        intent_source
-                    ),
-                    "burn_facts": dict(
-                        (
-                            ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
-                                "metrics"
-                            )
-                            or {}
-                        )
-                    ),
-                    "historical_query_result": historical_result,
-                    "plan_context": build_plan_compact_for_prompt(fresh_profile),
-                    "response_mode": (
-                        policy_forced_mode
-                        if policy_decision == "allow_constrained"
-                        else (
+            if (
+                not reply_message
+                and routed_intent not in {"plan_create_request", "plan_edit_request"}
+            ):
+                coach_started_at = time.perf_counter()
+                llm_calls_estimate += 1
+                coach_reply = await generate_coach_reply(
+                    effective_user_text,
+                    fresh_profile,
+                    session_context={
+                        "nutrition_logged_this_turn": nutrition_logged_this_turn,
+                        "voice_note_logged_this_turn": voice_note_logged_this_turn,
+                        "workout_logged_this_turn": workout_logged_this_turn,
+                        "workout_highlight": workout_highlight,
+                        "activity_burn_logged_this_turn": activity_burn_logged_this_turn,
+                        "activity_burn_added": activity_burn_added,
+                        "activity_assumptions": activity_assumptions[:3],
+                        "routed_intent": routed_intent,
+                        "router_confidence": routed_confidence,
+                        "intent_source": (
+                            intent_source
+                        ),
+                        "burn_facts": dict(
                             (
-                                (psych_analysis or {}).get("response_mode")
-                                if isinstance(psych_analysis, dict)
-                                else "push"
+                                ((fresh_profile.get("logs") or {}).get("current_day") or {}).get(
+                                    "metrics"
+                                )
+                                or {}
                             )
-                            or "push"
-                        )
-                    ),
-                    "policy_decision": policy_decision,
-                    "policy_reason": policy_reason,
-                },
-                trace_id=trace_id,
-            )
-            env_after = str(
-                ((fresh_profile.get("lifestyle") or {}).get("training_environment") or "")
-            ).strip().lower()
-            if env_after and env_after != env_before:
-                fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
-                log_agent_event(
-                    agent="memory_clerk",
-                    stage="training_env_persisted",
+                        ),
+                        "historical_query_result": historical_result,
+                        "plan_context": build_plan_compact_for_prompt(fresh_profile),
+                        "response_mode": (
+                            policy_forced_mode
+                            if policy_decision == "allow_constrained"
+                            else (
+                                (
+                                    (psych_analysis or {}).get("response_mode")
+                                    if isinstance(psych_analysis, dict)
+                                    else "push"
+                                )
+                                or "push"
+                            )
+                        ),
+                        "policy_decision": policy_decision,
+                        "policy_reason": policy_reason,
+                    },
                     trace_id=trace_id,
-                    details={"environment": env_after},
                 )
-            coach_elapsed_ms = int((time.perf_counter() - coach_started_at) * 1000)
-            if coach_reply.strip():
-                reply_message = coach_reply.strip()
-                if routed_intent in {"plan_create_request", "plan_edit_request"}:
-                    reason = (
-                        "create"
-                        if routed_intent == "plan_create_request"
-                        else "edit"
+                env_after = str(
+                    ((fresh_profile.get("lifestyle") or {}).get("training_environment") or "")
+                ).strip().lower()
+                if env_after and env_after != env_before:
+                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                    log_agent_event(
+                        agent="memory_clerk",
+                        stage="training_env_persisted",
+                        trace_id=trace_id,
+                        details={"environment": env_after},
                     )
+                if coach_reply.strip():
+                    reply_message = coach_reply.strip()
+            if routed_intent in {"plan_create_request", "plan_edit_request"}:
+                reason = "create" if routed_intent == "plan_create_request" else "edit"
+                cooldown_key = f"plan_req_cd:{phone_number}"
+                cooldown_until = get_cached(cooldown_key)
+                now_ts = int(time.time())
+                if (
+                    cooldown_until is not MISSING
+                    and isinstance(cooldown_until, int)
+                    and cooldown_until > now_ts
+                ):
+                    wait_seconds = max(5, cooldown_until - now_ts)
+                    reply_message = (
+                        f"Planner abhi busy hai due to rate limits. Please {wait_seconds}s baad same message bhejo."
+                    )
+                else:
                     plan_context = build_plan_compact_for_prompt(fresh_profile)
+                    required_days_per_week = infer_required_training_days_per_week(
+                        user_message=effective_user_text,
+                        living_profile=fresh_profile,
+                        default_days=5,
+                    )
+                    detailed_day_limit = infer_detailed_day_limit(
+                        effective_user_text,
+                        default_days=2,
+                    )
+                    goal_anchor = infer_goal_anchor(effective_user_text, fresh_profile)
                     llm_calls_estimate += 1
                     structured = await generate_structured_plan(
                         user_message=effective_user_text,
                         living_profile=fresh_profile,
                         plan_context=plan_context,
+                        request_mode=reason,
+                        strict_daywise=False,
+                        required_training_days_per_week=required_days_per_week,
+                        detailed_day_limit=detailed_day_limit,
+                        goal_anchor=goal_anchor,
                         trace_id=trace_id,
                     )
-                    inferred_type, inferred_horizon = infer_plan_type_and_horizon(
-                        effective_user_text
-                    )
-                    plan_type = str(structured.get("type") or inferred_type)
-                    horizon = str(structured.get("horizon") or inferred_horizon)
-                    week_blocks = structured.get("week_blocks") or []
-                    day_actions = structured.get("day_actions") or []
-                    response_text = str(structured.get("response_text") or "").strip()
-                    if response_text:
-                        llm_calls_estimate += 1
-                        coached = await run_critic_agent(
-                            response_text,
-                            source="plan_agent",
-                            living_profile=fresh_profile,
-                            trace_id=trace_id,
+                    generation_status = str(structured.get("generation_status") or "ok").strip().lower()
+                    error_message = str(structured.get("error_message") or "").strip()
+                    if generation_status != "ok":
+                        lower_error = error_message.lower()
+                        if "429" in lower_error or "quota" in lower_error or "rate" in lower_error:
+                            cooldown_until = now_ts + PLAN_REQUEST_COOLDOWN_SECONDS
+                            set_cached(
+                                cooldown_key,
+                                cooldown_until,
+                                ttl_seconds=PLAN_REQUEST_COOLDOWN_SECONDS,
+                            )
+                            reply_message = (
+                                "AI planner pe temporary load aa gaya hai (rate limit). "
+                                "Please 60 seconds baad same message bhejo, main draft continue karunga."
+                            )
+                        else:
+                            reply_message = (
+                                "Planner abhi temporary issue face kar raha hai. 20-30 seconds me dobara try karo."
+                            )
+                    else:
+                        inferred_type, inferred_horizon = infer_plan_type_and_horizon(
+                            effective_user_text
                         )
-                        if coached.strip():
-                            reply_message = coached.strip()
-                    fresh_profile = persist_plan_version(
-                        phone_number=phone_number,
-                        living_profile=fresh_profile,
-                        plan_text=reply_message,
-                        change_reason=reason,
-                        horizon_weeks=12,
-                        plan_type=plan_type,
-                        horizon=horizon,
-                        week_blocks=week_blocks,
-                        day_actions=day_actions,
-                    )
-                    fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                        plan_type = str(structured.get("type") or inferred_type)
+                        horizon = str(structured.get("horizon") or inferred_horizon)
+                        week_blocks = structured.get("week_blocks") or []
+                        day_actions = structured.get("day_actions") or []
+                        rolling_payload = structured.get("rolling") or {}
+                        show_full = is_full_plan_view_request(effective_user_text)
+                        needs_clarification = bool(structured.get("needs_clarification"))
+                        clarifying_questions = structured.get("clarifying_questions") or []
+                        overtraining_risk = str(
+                            structured.get("overtraining_risk") or "low"
+                        ).strip().lower()
+                        if needs_clarification:
+                            reply_message = build_plan_intake_questionnaire(
+                                clarifying_questions if isinstance(clarifying_questions, list) else []
+                            )
+                            if overtraining_risk == "high":
+                                reply_message += (
+                                    "\n\nSafety note: Aapka ask aggressive lag raha hai. Pehle 1-week ramp-up try karte hain, "
+                                    "phir intensity badhayenge."
+                                )
+                        else:
+                            response_preview = str(
+                                structured.get("response_text_preview") or ""
+                            ).strip()
+                            response_full = str(
+                                structured.get("response_text_full") or ""
+                            ).strip()
+                            response_text = response_full if show_full else response_preview
+                            if response_text:
+                                reply_message = response_text
+                            horizon_weeks = structured.get("weeks_total")
+                            try:
+                                horizon_weeks = int(float(horizon_weeks))
+                            except (TypeError, ValueError):
+                                horizon_weeks = 0
+                            if horizon_weeks <= 0:
+                                horizon_weeks = min(
+                                    12,
+                                    max(
+                                        1,
+                                        len(week_blocks) if isinstance(week_blocks, list) else 1,
+                                    ),
+                                )
+                            rolling_mode_enabled = True
+                            is_sufficient = has_sufficient_plan_structure(
+                                week_blocks=week_blocks,
+                                day_actions=day_actions,
+                                horizon_weeks=horizon_weeks,
+                                plan_type=plan_type,
+                            )
+                            requires_training_day_coverage = str(plan_type).strip().lower() in {
+                                "training",
+                                "hybrid",
+                            }
+                            if rolling_mode_enabled:
+                                is_sufficient = has_rolling_valid_structure(rolling_payload)
+                            required_weeks = 1 if rolling_mode_enabled else min(
+                                12,
+                                max(1, horizon_weeks if horizon_weeks > 0 else 1),
+                            )
+                            required_days_for_gate = (
+                                min(required_days_per_week, detailed_day_limit)
+                                if rolling_mode_enabled
+                                else required_days_per_week
+                            )
+                            has_full_days = has_full_week_day_coverage(
+                                week_blocks=week_blocks,
+                                required_weeks=required_weeks,
+                                required_days_per_week=required_days_for_gate,
+                            )
+                            if requires_training_day_coverage and not has_full_days:
+                                is_sufficient = False
+                            if not is_sufficient:
+                                llm_calls_estimate += 1
+                                strict_structured = await generate_structured_plan(
+                                    user_message=effective_user_text,
+                                    living_profile=fresh_profile,
+                                    plan_context=plan_context,
+                                    request_mode=reason,
+                                    strict_daywise=True,
+                                    required_training_days_per_week=required_days_per_week,
+                                    detailed_day_limit=detailed_day_limit,
+                                    goal_anchor=goal_anchor,
+                                    trace_id=trace_id,
+                                )
+                                if (
+                                    str(strict_structured.get("generation_status") or "ok").strip().lower()
+                                    == "ok"
+                                ):
+                                    plan_type = str(strict_structured.get("type") or plan_type)
+                                    horizon = str(strict_structured.get("horizon") or horizon)
+                                    week_blocks = strict_structured.get("week_blocks") or week_blocks
+                                    day_actions = strict_structured.get("day_actions") or day_actions
+                                    rolling_payload = strict_structured.get("rolling") or rolling_payload
+                                    needs_clarification = bool(strict_structured.get("needs_clarification"))
+                                    clarifying_questions = strict_structured.get("clarifying_questions") or []
+                                    overtraining_risk = str(
+                                        strict_structured.get("overtraining_risk") or overtraining_risk
+                                    ).strip().lower()
+                                    if needs_clarification:
+                                        reply_message = build_plan_intake_questionnaire(
+                                            clarifying_questions
+                                            if isinstance(clarifying_questions, list)
+                                            else []
+                                        )
+                                        if overtraining_risk == "high":
+                                            reply_message += (
+                                                "\n\nSafety note: Aapka ask aggressive lag raha hai. Pehle 1-week ramp-up try karte hain, "
+                                                "phir intensity badhayenge."
+                                            )
+                                    else:
+                                        strict_preview = str(
+                                            strict_structured.get("response_text_preview") or ""
+                                        ).strip()
+                                        strict_full = str(
+                                            strict_structured.get("response_text_full") or ""
+                                        ).strip()
+                                        strict_text = strict_full if show_full else strict_preview
+                                        if strict_text:
+                                            reply_message = strict_text
+                                        strict_weeks = strict_structured.get("weeks_total")
+                                        try:
+                                            horizon_weeks = int(float(strict_weeks))
+                                        except (TypeError, ValueError):
+                                            horizon_weeks = horizon_weeks
+                                        if horizon_weeks <= 0:
+                                            horizon_weeks = min(
+                                                12,
+                                                max(
+                                                    1,
+                                                    len(week_blocks) if isinstance(week_blocks, list) else 1,
+                                                ),
+                                            )
+                                        is_sufficient = has_sufficient_plan_structure(
+                                            week_blocks=week_blocks,
+                                            day_actions=day_actions,
+                                            horizon_weeks=horizon_weeks,
+                                            plan_type=plan_type,
+                                        )
+                                        if rolling_mode_enabled:
+                                            is_sufficient = has_rolling_valid_structure(rolling_payload)
+                                        if requires_training_day_coverage and not has_full_week_day_coverage(
+                                            week_blocks=week_blocks,
+                                            required_weeks=(
+                                                1
+                                                if rolling_mode_enabled
+                                                else min(
+                                                    12,
+                                                    max(
+                                                        1,
+                                                        horizon_weeks if horizon_weeks > 0 else 1,
+                                                    ),
+                                                )
+                                            ),
+                                            required_days_per_week=(
+                                                min(required_days_per_week, detailed_day_limit)
+                                                if rolling_mode_enabled
+                                                else required_days_per_week
+                                            ),
+                                        ):
+                                            is_sufficient = False
+                                        if rolling_mode_enabled and not has_rolling_valid_structure(
+                                            rolling_payload
+                                        ):
+                                            is_sufficient = False
+                            if not is_sufficient:
+                                missing_inputs = (
+                                    (rolling_payload.get("missing_inputs") or [])
+                                    if isinstance(rolling_payload, dict)
+                                    else []
+                                )
+                                cleaned_missing = [
+                                    str(x).strip() for x in missing_inputs if str(x).strip()
+                                ][:3]
+                                defaults_missing = [
+                                    "Weekly training frequency (default 5 days/week)",
+                                    "Session duration + available equipment",
+                                    "Any injury-safe movement limits",
+                                ]
+                                while len(cleaned_missing) < 3:
+                                    cleaned_missing.append(defaults_missing[len(cleaned_missing)])
+                                reply_message = (
+                                    "I need these 3 fields to generate next 2 detailed days:\n"
+                                    f"- {cleaned_missing[0]}\n"
+                                    f"- {cleaned_missing[1]}\n"
+                                    f"- {cleaned_missing[2]}\n\n"
+                                    "Reply in one message and I will generate your next 2 detailed days."
+                                )
+                                log_agent_event(
+                                    agent="plan_agent",
+                                    stage="insufficient_structure_guard",
+                                    status="warn",
+                                    trace_id=trace_id,
+                                    details={
+                                        "horizon_weeks": horizon_weeks,
+                                        "week_blocks": len(week_blocks)
+                                        if isinstance(week_blocks, list)
+                                        else 0,
+                                        "day_actions": len(day_actions)
+                                        if isinstance(day_actions, list)
+                                        else 0,
+                                    },
+                                )
+                            else:
+                                fresh_profile = persist_plan_version(
+                                    phone_number=phone_number,
+                                    living_profile=fresh_profile,
+                                    plan_text=reply_message,
+                                    change_reason=reason,
+                                    horizon_weeks=horizon_weeks,
+                                    plan_type=plan_type,
+                                    horizon=horizon,
+                                    week_blocks=week_blocks,
+                                    day_actions=day_actions,
+                                    required_training_days_per_week=required_days_per_week,
+                                    detailed_day_limit=detailed_day_limit,
+                                    goal_anchor=goal_anchor,
+                                    rolling_payload=rolling_payload,
+                                )
+                                fresh_profile, current_profile_version = _persist_with_retry(
+                                    fresh_profile
+                                )
+                                if should_render_plan_now(effective_user_text):
+                                    latest_plan = fetch_latest_plan_version(phone_number)
+                                    latest_payload = (
+                                        (latest_plan or {}).get("plan_payload") or {}
+                                        if isinstance(latest_plan, dict)
+                                        else {}
+                                    )
+                                    if isinstance(latest_payload, dict) and latest_payload:
+                                        reply_message = render_plan_view(latest_payload, show_full=True)
         log_agent_event(
             agent="front_desk",
             stage="pipeline_complete",
@@ -1808,6 +2445,9 @@ async def _process_and_send_twilio_reply(
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[Observability] Failed to enqueue operation metric: {exc}")
+
+    if not str(reply_message or "").strip():
+        reply_message = "Give me a second, optimizing your plan..."
 
     if quota_warning_suffix and "trial limit" not in reply_message.lower():
         reply_message = f"{reply_message}{quota_warning_suffix}"
@@ -1955,14 +2595,18 @@ async def debug_user_living_profile(user_ref: str) -> JSONResponse:
         return JSONResponse(content={"error": "user_ref is required"}, status_code=400)
 
     # First try as users.id (UUID string), then fallback to phone_number.
-    by_id = (
-        supabase.table("users")
-        .select("id,phone_number,living_profile,updated_at")
-        .eq("id", ref)
-        .limit(1)
-        .execute()
-    )
-    rows = by_id.data or []
+    rows: list[dict[str, Any]] = []
+    try:
+        by_id = (
+            supabase.table("users")
+            .select("id,phone_number,living_profile,updated_at")
+            .eq("id", ref)
+            .limit(1)
+            .execute()
+        )
+        rows = by_id.data or []
+    except Exception:
+        rows = []
     if not rows:
         by_phone = (
             supabase.table("users")

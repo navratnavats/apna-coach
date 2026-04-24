@@ -66,21 +66,29 @@ def _today_food_entries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        summary = str(item.get("summary") or "").strip()
+        try:
+            estimated_calories = int(float(item.get("estimated_calories") or 0))
+        except (TypeError, ValueError):
+            estimated_calories = 0
         local_date = str(item.get("local_date") or "").strip()
         if local_date:
-            if local_date == today_local.isoformat():
+            if local_date == today_local.isoformat() and (summary or estimated_calories > 0):
                 entries.append(item)
             continue
         logged_at = str(item.get("logged_at") or "").strip()
         if not logged_at:
-            entries.append(item)
+            # Drop placeholder/noise entries with no time + no content.
+            if summary or estimated_calories > 0:
+                entries.append(item)
             continue
         try:
             dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
-            if dt.astimezone(tz).date() == today_local:
+            if dt.astimezone(tz).date() == today_local and (summary or estimated_calories > 0):
                 entries.append(item)
         except Exception:
-            entries.append(item)
+            if summary or estimated_calories > 0:
+                entries.append(item)
     return entries
 
 
