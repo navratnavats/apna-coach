@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 MAX_CAPABILITY_INTENT_RETRIES = 2
 
@@ -30,7 +32,11 @@ def should_check_capability_intent_with_llm(user_message: str) -> bool:
     return True
 
 
-async def classify_capability_discovery_intent(user_message: str) -> tuple[bool, str]:
+async def classify_capability_discovery_intent(
+    user_message: str,
+    *,
+    trace_id: str | None = None,
+) -> tuple[bool, str]:
     if not GEMINI_API_KEY:
         return False, "no_api_key"
 
@@ -42,6 +48,7 @@ async def classify_capability_discovery_intent(user_message: str) -> tuple[bool,
     )
 
     def _call_model(payload: dict[str, str]) -> tuple[bool, str]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -49,6 +56,20 @@ async def classify_capability_discovery_intent(user_message: str) -> tuple[bool,
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="capability_intent_agent",
+            stage="classify_capability_intent",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         raw = json.loads((response.text or "{}").strip())
         is_capability = bool(raw.get("is_capability_query"))

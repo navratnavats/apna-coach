@@ -62,3 +62,7 @@ TRIAL_DAILY_TURN_WARNING_THRESHOLD: int = int(
     os.getenv("TRIAL_DAILY_TURN_WARNING_THRESHOLD", "20")
 )
 
+# Observability controls (redaction policy can layer on top later).
+OBS_LOG_FULL_PAYLOAD: bool = os.getenv("OBS_LOG_FULL_PAYLOAD", "false").lower() == "true"
+OBS_PREVIEW_MAX_CHARS: int = int(os.getenv("OBS_PREVIEW_MAX_CHARS", "1200"))
+

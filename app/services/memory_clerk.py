@@ -19,6 +19,7 @@ from app.config import (
     TWILIO_AUTH_TOKEN,
 )
 from app.services.agent_trace import log_agent_event
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 
 MAX_MEMORY_RETRIES = 3
@@ -169,6 +170,20 @@ async def ai_memory_clerk(
         )
         response_text = response.text or "{}"
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="memory_clerk",
+            stage="profile_extract",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response_text,
+            usage=usage,
+        )
         print(f"[AI] Response received in {elapsed_ms} ms (chars={len(response_text)})")
         parsed = extract_json_from_model_text(response_text)
         print(f"[AI] Parsed update keys: {sorted(parsed.keys())}")
@@ -293,6 +308,20 @@ async def ai_nutrition_from_image(
         )
         response_text = response.text or "{}"
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="nutritionist",
+            stage="vision_extract",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload={"payload": payload, "has_image": True},
+            response_text=response_text,
+            usage=usage,
+        )
         print(
             f"[AI Vision] Response received in {elapsed_ms} ms "
             f"(chars={len(response_text)})"
@@ -388,6 +417,20 @@ async def ai_transcribe_voice_note(
         )
         response_text = response.text or "{}"
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="memory_clerk",
+            stage="voice_transcribe",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload={"payload": payload, "media_content_type": media_content_type},
+            response_text=response_text,
+            usage=usage,
+        )
         print(
             f"[AI Audio] Response received in {elapsed_ms} ms "
             f"(chars={len(response_text)})"

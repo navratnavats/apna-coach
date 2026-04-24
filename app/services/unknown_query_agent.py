@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -10,6 +11,7 @@ from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
 from app.services.messages import unknown_query_clarifier
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 
 MAX_UNKNOWN_RETRIES = 3
@@ -70,6 +72,7 @@ async def build_unknown_intent_contract(
     )
 
     def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -77,6 +80,20 @@ async def build_unknown_intent_contract(
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="unknown_query_agent",
+            stage="clarify_intent",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         raw = json.loads((response.text or "{}").strip())
         if not isinstance(raw, dict):

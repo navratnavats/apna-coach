@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -17,6 +18,7 @@ from app.services.messages import (
     morning_quick_hit_no_llm,
 )
 from app.services.medical_safety_officer import run_medical_safety_officer
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 
 
@@ -72,6 +74,7 @@ async def generate_morning_workout_nudge(
     )
 
     def _call_model() -> str:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -79,6 +82,20 @@ async def generate_morning_workout_nudge(
         response = model.generate_content(
             json.dumps({"living_profile": living_profile}, ensure_ascii=False),
             generation_config={"response_mime_type": "text/plain"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="workout_programmer",
+            stage="generate_morning_nudge",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload={"living_profile": living_profile},
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         return (response.text or "").strip()
 
