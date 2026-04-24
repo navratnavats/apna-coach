@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from typing import Any
-
-import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.llm_contract_runner import run_json_contract
 from app.services.messages import policy_out_of_scope
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
@@ -124,17 +120,7 @@ async def classify_query_policy(
         "- Output strict JSON only."
     )
 
-    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         usage = extract_gemini_usage(response)
         enqueue_llm_call_event(
             operation_id=None,
@@ -146,46 +132,28 @@ async def classify_query_policy(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=usage,
         )
-        parsed = json.loads((response.text or "{}").strip())
-        return parsed if isinstance(parsed, dict) else {}
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
+        decision = str(raw.get("decision") or "").strip().lower()
+        confidence = str(raw.get("confidence") or "").strip().lower()
+        if decision not in ALLOWED_DECISIONS:
+            raise ValueError(f"invalid_decision:{decision or 'empty'}")
+        if confidence not in ALLOWED_CONFIDENCE:
+            raise ValueError(f"invalid_confidence:{confidence or 'empty'}")
+        return raw
 
-    previous_error = ""
-    previous_output: dict[str, Any] = {}
-    parsed: dict[str, Any] | None = None
-    for attempt in range(1, MAX_POLICY_RETRIES + 1):
-        payload = {
-            "user_message": text,
-            "has_media": has_media,
-            "retry_context": (
-                {
-                    "attempt": attempt,
-                    "previous_failure_reason": previous_error,
-                    "previous_output": previous_output,
-                    "instruction": "Fix previous failure; do not repeat same invalid output.",
-                }
-                if attempt > 1
-                else {}
-            ),
-        }
-        try:
-            raw = await asyncio.to_thread(_call_model, payload)
-            decision = str(raw.get("decision") or "").strip().lower()
-            confidence = str(raw.get("confidence") or "").strip().lower()
-            if decision not in ALLOWED_DECISIONS:
-                raise ValueError(f"invalid_decision:{decision or 'empty'}")
-            if confidence not in ALLOWED_CONFIDENCE:
-                raise ValueError(f"invalid_confidence:{confidence or 'empty'}")
-            if raw == previous_output and attempt > 1:
-                raise ValueError("repeated_same_output")
-            parsed = raw
-            break
-        except Exception as exc:
-            previous_error = str(exc)
-            previous_output = raw if isinstance(locals().get("raw"), dict) else previous_output
-    if parsed is None:
+    try:
+        parsed = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": text, "has_media": has_media},
+            max_retries=MAX_POLICY_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+    except Exception:
         return _deterministic_fallback(text)
 
     decision = str(parsed.get("decision") or "allow").strip().lower()

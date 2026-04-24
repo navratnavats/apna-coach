@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import time
-
-import google.generativeai as genai
-
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.llm_contract_runner import run_json_contract
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 MAX_CAPABILITY_INTENT_RETRIES = 2
@@ -47,17 +42,7 @@ async def classify_capability_discovery_intent(
         "Mark false for normal logging/coaching requests."
     )
 
-    def _call_model(payload: dict[str, str]) -> tuple[bool, str]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, str], response_text: str, elapsed_ms: int, response: object) -> None:
         enqueue_llm_call_event(
             operation_id=trace_id,
             trace_id=trace_id,
@@ -68,27 +53,25 @@ async def classify_capability_discovery_intent(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=extract_gemini_usage(response),
         )
-        raw = json.loads((response.text or "{}").strip())
+    def _validate(raw: dict[str, object]) -> tuple[bool, str]:
         is_capability = bool(raw.get("is_capability_query"))
         confidence = str(raw.get("confidence") or "low").strip().lower()
         if confidence not in {"high", "medium", "low"}:
             raise ValueError("invalid_confidence")
         return is_capability, confidence
 
-    previous_error = ""
-    for attempt in range(1, MAX_CAPABILITY_INTENT_RETRIES + 1):
-        payload = {
-            "user_message": user_message,
-            "retry_context": (
-                f"attempt={attempt}; previous_error={previous_error[:120]}" if attempt > 1 else ""
-            ),
-        }
-        try:
-            is_capability, confidence = await asyncio.to_thread(_call_model, payload)
-            return is_capability and confidence != "low", confidence
-        except Exception as exc:  # noqa: BLE001
-            previous_error = str(exc)
-    return False, "failed"
+    try:
+        is_capability, confidence = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_CAPABILITY_INTENT_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+        return is_capability and confidence != "low", confidence
+    except Exception:  # noqa: BLE001
+        return False, "failed"

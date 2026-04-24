@@ -43,6 +43,7 @@ from app.services.messages import (
     ack_image,
     ack_long_text,
     image_rejection,
+    injury_saved_plan_adjust_prompt,
     onboarding_help,
     onboarding_field_explanations,
     onboarding_status,
@@ -63,15 +64,17 @@ from app.services.capability_intent_agent import (
     should_check_capability_intent_with_llm,
 )
 from app.services.intake_agent import (
-    build_graduation_message,
+    build_onboarding_completion_message,
     build_intake_prompt,
     get_missing_onboarding_fields,
     ONBOARDING_FIELDS,
     refresh_onboarding_session_state,
-    reset_onboarding_profile_fields,
     touch_onboarding_session,
 )
-from app.services.onboarding_policy import evaluate_onboarding_message
+from app.services.onboarding_policy import (
+    classify_onboarding_control_intent,
+    evaluate_onboarding_message,
+)
 from app.services.persona import resolve_user_address
 from app.services.intent_router import classify_router_intent
 from app.services.intent_contract import (
@@ -121,97 +124,6 @@ _batch_flush_tasks: dict[str, asyncio.Task] = {}
 _phone_queues: dict[str, deque[dict[str, Any]]] = {}
 _phone_worker_tasks: dict[str, asyncio.Task] = {}
 USER_PROFILE_CACHE_TTL_SECONDS = 45
-
-
-def _detect_onboarding_control_intent(user_message: str) -> str:
-    text = str(user_message or "").strip().lower()
-    if not text:
-        return "none"
-    restart_markers = (
-        "restart onboarding",
-        "reset onboarding",
-        "start onboarding again",
-        "onboarding restart",
-        "onboarding dobara",
-        "onboarding reset",
-        "phirse onboarding",
-    )
-    edit_markers = (
-        "edit onboarding",
-        "update onboarding",
-        "change onboarding",
-        "edit profile",
-        "update profile",
-        "onboarding edit",
-        "profile edit",
-        "details update",
-        "detail update",
-    )
-    status_markers = (
-        "onboarding status",
-        "is onboarding complete",
-        "onboarding complete?",
-        "status of onboarding",
-        "onboarding complete hua",
-        "complete hua kya",
-        "status kya hai",
-    )
-    left_markers = (
-        "what is left",
-        "what's left",
-        "what all is left",
-        "kya bacha",
-        "kya bacha hai",
-        "kya pending hai",
-        "ab kya dena hai",
-        "what remains",
-    )
-    help_markers = (
-        "onboarding help",
-        "help onboarding",
-        "onboarding commands",
-    )
-    explain_markers = (
-        "what does this step mean",
-        "what does this mean",
-        "is step ka matlab",
-        "matlab kya",
-        "explain this step",
-        "ye step kya hai",
-        "yeh step kya hai",
-        "samjha do",
-    )
-    if any(m in text for m in restart_markers):
-        return "restart"
-    if any(m in text for m in edit_markers):
-        return "edit"
-    if any(m in text for m in status_markers):
-        return "status"
-    if any(m in text for m in left_markers):
-        return "left"
-    if any(m in text for m in help_markers):
-        return "help"
-    if any(m in text for m in explain_markers):
-        return "explain"
-    return "none"
-
-
-def _is_capability_discovery_query(user_message: str) -> bool:
-    text = str(user_message or "").strip().lower()
-    if not text:
-        return False
-    markers = (
-        "what can you do",
-        "what all you can do",
-        "features",
-        "feature list",
-        "help me with",
-        "can you do",
-        "is this possible",
-        "what is possible",
-        "capabilities",
-    )
-    return any(marker in text for marker in markers)
 
 
 def _filter_onboarding_updates(updates: dict[str, Any]) -> dict[str, Any]:
@@ -450,6 +362,73 @@ def _merge_image_food_entries(entries: list[dict[str, Any]]) -> list[dict[str, A
         "confidence": combined_confidence,
     }
     return [merged]
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return False
+
+
+def _normalize_activity_intent(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    alias = {
+        "performed_now": "performed_event",
+        "performed": "performed_event",
+        "habitual": "habitual_context",
+        "habit": "habitual_context",
+        "future": "future_plan",
+    }
+    return alias.get(raw, raw or "unknown")
+
+
+def _activity_burn_guard(
+    entry: dict[str, Any],
+    *,
+    onboarding_fast_lane: bool,
+) -> tuple[bool, str]:
+    if not isinstance(entry, dict):
+        return False, "invalid_entry"
+    intent_type = _normalize_activity_intent(entry.get("intent_type"))
+    if intent_type != "performed_event":
+        return False, f"intent_not_performed:{intent_type}"
+    if not _to_bool(entry.get("safe_to_burn")):
+        return False, "safe_to_burn_false"
+    try:
+        duration_mins = float(entry.get("duration_mins") or 0)
+    except (TypeError, ValueError):
+        duration_mins = 0.0
+    if duration_mins <= 0:
+        return False, "performed_without_duration"
+    time_anchor = str(entry.get("time_anchor") or "none").strip().lower()
+    if onboarding_fast_lane and time_anchor in {"none", ""}:
+        return False, "onboarding_missing_time_anchor"
+    if onboarding_fast_lane and not _to_bool(entry.get("completion_signal")):
+        return False, "onboarding_missing_completion_signal"
+    return True, "ok"
+
+
+def _explicit_plan_adjust_requested(user_message: str) -> bool:
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "adjust plan",
+        "change plan",
+        "modify plan",
+        "edit plan",
+        "update plan",
+        "plan change",
+        "plan bhi change",
+        "plan also change",
+        "plan revise",
+        "routine change",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _cleanup_recent_events(now_ts: float) -> None:
@@ -728,21 +707,57 @@ async def _process_and_send_twilio_reply(
             today_local_iso = datetime.now(ZoneInfo(inferred_tz)).date().isoformat()
         except Exception:
             today_local_iso = datetime.now(timezone.utc).date().isoformat()
+        merged_profile, missing_before_turn, onboarding_session_expired = refresh_onboarding_session_state(
+            merged_profile
+        )
+        onboarding_fast_lane = len(missing_before_turn) > 0
         temporal_hint: dict[str, Any] = {}
-        if should_invoke_temporal_agent(effective_user_text):
+        if (not onboarding_fast_lane) and should_invoke_temporal_agent(effective_user_text):
             llm_calls_estimate += 1
             temporal_hint = await parse_temporal_intent(
                 user_text=effective_user_text,
                 timezone_name=inferred_tz,
                 trace_id=trace_id,
             )
-        merged_profile, missing_before_turn, onboarding_session_expired = refresh_onboarding_session_state(
-            merged_profile
+        control_result = await classify_onboarding_control_intent(
+            user_message=effective_user_text,
+            pending_fields=missing_before_turn,
         )
-        onboarding_fast_lane = len(missing_before_turn) > 0
-        onboarding_control_intent = _detect_onboarding_control_intent(effective_user_text)
-        capability_query = _is_capability_discovery_query(effective_user_text)
-        if (not capability_query) and should_check_capability_intent_with_llm(effective_user_text):
+        onboarding_control_intent = str(control_result.get("intent") or "none")
+        log_agent_event(
+            agent="policy_gate",
+            stage="onboarding_control_classified",
+            trace_id=trace_id,
+            details={
+                "intent": onboarding_control_intent,
+                "confidence": str(control_result.get("confidence") or "low"),
+                "reason": str(control_result.get("reason") or ""),
+            },
+        )
+        if onboarding_control_intent == "restart":
+            # Restart should work even after onboarding is complete; reset profile in DB.
+            merged_profile = load_default_living_profile()
+            merged_profile["onboarding_complete"] = False
+            merged_profile = touch_onboarding_session(
+                merged_profile,
+                missing_fields=ONBOARDING_FIELDS,
+            )
+            merged_profile, current_profile_version = _persist_with_retry(merged_profile)
+            log_agent_event(
+                agent="intake_agent",
+                stage="onboarding_restarted",
+                trace_id=trace_id,
+                details={"scope": "full_profile_reset"},
+            )
+            address = resolve_user_address(merged_profile)
+            reply_message = onboarding_restart_done(address)
+            return
+        capability_query = False
+        if (
+            (not onboarding_fast_lane)
+            and (not capability_query)
+            and should_check_capability_intent_with_llm(effective_user_text)
+        ):
             llm_calls_estimate += 1
             capability_query, capability_confidence = await classify_capability_discovery_intent(
                 effective_user_text,
@@ -754,41 +769,6 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
                 details={"detected": capability_query, "confidence": capability_confidence},
             )
-        if onboarding_control_intent == "help":
-            address = resolve_user_address(merged_profile)
-            reply_message = onboarding_help(address)
-            return
-        if onboarding_control_intent in {"status", "left"}:
-            address = resolve_user_address(merged_profile)
-            reply_message = onboarding_status(
-                address,
-                is_complete=not onboarding_fast_lane,
-                pending_fields=missing_before_turn,
-            )
-            return
-        if onboarding_control_intent == "explain":
-            address = resolve_user_address(merged_profile)
-            reply_message = onboarding_field_explanations(address, missing_before_turn)
-            return
-        if onboarding_control_intent == "restart":
-            merged_profile = reset_onboarding_profile_fields(merged_profile)
-            merged_profile = touch_onboarding_session(
-                merged_profile,
-                missing_fields=ONBOARDING_FIELDS,
-            )
-            merged_profile, current_profile_version = _persist_with_retry(merged_profile)
-            log_agent_event(
-                agent="intake_agent",
-                stage="onboarding_restarted",
-                trace_id=trace_id,
-            )
-            address = resolve_user_address(merged_profile)
-            reply_message = onboarding_restart_done(address)
-            return
-        if onboarding_control_intent == "edit" and not onboarding_fast_lane:
-            address = resolve_user_address(merged_profile)
-            reply_message = onboarding_edit_help(address)
-            return
         if capability_query:
             address = resolve_user_address(merged_profile)
             if onboarding_fast_lane:
@@ -802,6 +782,23 @@ async def _process_and_send_twilio_reply(
             )
             return
 
+        if onboarding_fast_lane:
+            if onboarding_control_intent == "help":
+                address = resolve_user_address(merged_profile)
+                reply_message = onboarding_help(address)
+                return
+            if onboarding_control_intent in {"status", "left"}:
+                address = resolve_user_address(merged_profile)
+                reply_message = onboarding_status(
+                    address,
+                    is_complete=False,
+                    pending_fields=missing_before_turn,
+                )
+                return
+            if onboarding_control_intent == "explain":
+                address = resolve_user_address(merged_profile)
+                reply_message = onboarding_field_explanations(address, missing_before_turn)
+                return
         policy_decision = "allow"
         policy_reason = "normal"
         policy_forced_mode = "push"
@@ -823,11 +820,14 @@ async def _process_and_send_twilio_reply(
                 address = resolve_user_address(merged_profile)
                 reply_message = onboarding_edit_help(address)
                 return
-            onboarding_policy = evaluate_onboarding_message(
+            onboarding_policy = await evaluate_onboarding_message(
                 user_message=effective_user_text,
                 pending_fields=missing_before_turn,
                 has_media=bool(media_items),
             )
+            matched_fields = onboarding_policy.get("matched_fields") or []
+            if isinstance(matched_fields, list) and matched_fields:
+                onboarding_control_intent = "none"
             onboarding_policy_decision = str(onboarding_policy.get("decision") or "allow")
             policy_reason = "onboarding_fast_lane"
             policy_forced_mode = "support"
@@ -1006,6 +1006,7 @@ async def _process_and_send_twilio_reply(
         extracted_activity_adjustment: dict[str, Any] | None = None
         extracted_workout_complete: Optional[bool] = None
         extracted_water_delta_liters: Optional[float] = None
+        injury_update_detected = False
         if isinstance(extracted_logs, dict):
             raw_nutrition = extracted_logs.get("nutrition_log")
             if isinstance(raw_nutrition, list):
@@ -1070,6 +1071,9 @@ async def _process_and_send_twilio_reply(
             extracted_updates["logs"] = extracted_logs
 
         merged_profile = deep_merge_profile(merged_profile, extracted_updates)
+        physiology_updates = extracted_updates.get("physiology")
+        if isinstance(physiology_updates, dict) and "injuries" in physiology_updates:
+            injury_update_detected = True
         nutrition_logged_this_turn = False
         workout_logged_this_turn = False
         workout_highlight = ""
@@ -1277,8 +1281,29 @@ async def _process_and_send_twilio_reply(
             physiology = merged_profile.get("physiology") or {}
             biometrics = physiology.get("biometrics") or {}
             weight_kg = float(biometrics.get("weight") or 0)
+            processed_activity_entries = 0
+            saw_low_detail_performed_activity = False
 
             for raw_activity in extracted_activity_entries:
+                raw_entry = dict(raw_activity) if isinstance(raw_activity, dict) else {}
+                allow_burn, burn_guard_reason = _activity_burn_guard(
+                    raw_entry,
+                    onboarding_fast_lane=onboarding_fast_lane,
+                )
+                if not allow_burn:
+                    if burn_guard_reason == "performed_without_duration":
+                        saw_low_detail_performed_activity = True
+                    log_agent_event(
+                        agent="bio_math",
+                        stage="activity_burn_skipped",
+                        trace_id=trace_id,
+                        details={
+                            "reason": burn_guard_reason,
+                            "intent_type": _normalize_activity_intent(raw_entry.get("intent_type")),
+                            "safe_to_burn": _to_bool(raw_entry.get("safe_to_burn")),
+                        },
+                    )
+                    continue
                 normalized = normalize_activity_for_burn(raw_activity)
                 burn_cals = 0
                 if weight_kg > 0:
@@ -1289,6 +1314,10 @@ async def _process_and_send_twilio_reply(
                     )
                 entry = dict(normalized)
                 entry["burn_cals"] = burn_cals
+                entry["intent_type"] = _normalize_activity_intent(raw_entry.get("intent_type"))
+                entry["time_anchor"] = str(raw_entry.get("time_anchor") or "none").strip().lower()
+                entry["safe_to_burn"] = _to_bool(raw_entry.get("safe_to_burn"))
+                entry["completion_signal"] = _to_bool(raw_entry.get("completion_signal"))
                 temporal = build_temporal_metadata(
                     timezone_name=inferred_tz,
                     message_text=effective_user_text,
@@ -1304,10 +1333,12 @@ async def _process_and_send_twilio_reply(
                 if str(entry.get("local_date") or "").strip() == today_local_iso:
                     activity_log.append(entry)
                     activity_burn_added += burn_cals
+                    processed_activity_entries += 1
                     assumption_note = str(entry.get("assumption_note") or "").strip()
                     if assumption_note:
                         activity_assumptions.append(assumption_note)
                 else:
+                    processed_activity_entries += 1
                     upsert_historical_day(
                         phone_number=phone_number,
                         archive_date=str(entry.get("local_date") or today_local_iso),
@@ -1323,6 +1354,8 @@ async def _process_and_send_twilio_reply(
                 existing_active = 0
             current_day["active_cals_burnt"] = existing_active + activity_burn_added
             logs["activity_log"] = activity_log
+            if saw_low_detail_performed_activity:
+                current_day["workout_complete"] = True
             logs["current_day"] = current_day
             merged_profile["logs"] = logs
             activity_burn_logged_this_turn = activity_burn_added > 0
@@ -1330,7 +1363,11 @@ async def _process_and_send_twilio_reply(
                 agent="bio_math",
                 stage="activity_burn_updated",
                 trace_id=trace_id,
-                details={"entries": len(extracted_activity_entries), "added_cals": activity_burn_added},
+                details={
+                    "entries": len(extracted_activity_entries),
+                    "processed_entries": processed_activity_entries,
+                    "added_cals": activity_burn_added,
+                },
             )
 
         if extracted_activity_adjustment:
@@ -1381,6 +1418,24 @@ async def _process_and_send_twilio_reply(
                             stage="activity_burn_recalculated",
                             trace_id=trace_id,
                             details={"delta_cals": delta, "new_burn": new_burn},
+                        )
+                elif mode == "drop_last":
+                    last_entry = activity_log.pop() if activity_log else None
+                    if isinstance(last_entry, dict):
+                        drop_burn = int(float(last_entry.get("burn_cals") or 0))
+                        current_day["active_cals_burnt"] = max(
+                            0,
+                            int(float(current_day.get("active_cals_burnt") or 0)) - drop_burn,
+                        )
+                        logs["activity_log"] = activity_log
+                        logs["current_day"] = current_day
+                        merged_profile["logs"] = logs
+                        activity_burn_added -= drop_burn
+                        log_agent_event(
+                            agent="bio_math",
+                            stage="activity_burn_removed",
+                            trace_id=trace_id,
+                            details={"removed_cals": drop_burn},
                         )
 
         if extracted_water_delta_liters and extracted_water_delta_liters > 0:
@@ -1503,8 +1558,14 @@ async def _process_and_send_twilio_reply(
             and daily_targets_fresh is not None
         ):
             fresh_profile["onboarding_complete"] = True
+            onboarding_state = fresh_profile.get("onboarding") or {}
+            if not isinstance(onboarding_state, dict):
+                onboarding_state = {}
+            onboarding_state["completion_overview_sent"] = True
+            onboarding_state["completion_overview_sent_at"] = datetime.now(timezone.utc).isoformat()
+            fresh_profile["onboarding"] = onboarding_state
             fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
-            reply_message = build_graduation_message(fresh_profile)
+            reply_message = build_onboarding_completion_message(fresh_profile)
             log_agent_event(
                 agent="intake_agent",
                 stage="graduated",
@@ -1522,13 +1583,17 @@ async def _process_and_send_twilio_reply(
                 onboarding_missing_biometrics()
             )
         elif routed_intent == "plan_change_signal":
-            fresh_profile = upsert_pending_change_request(
-                fresh_profile, effective_user_text
-            )
-            fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
-            reply_message = (
-                "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
-            )
+            plan_adjust_explicit = _explicit_plan_adjust_requested(effective_user_text)
+            if injury_update_detected and not plan_adjust_explicit:
+                reply_message = injury_saved_plan_adjust_prompt()
+            else:
+                fresh_profile = upsert_pending_change_request(
+                    fresh_profile, effective_user_text
+                )
+                fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+                reply_message = (
+                    "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
+                )
         else:
             latest_plan = None
             if routed_intent in PLAN_INTENTS:

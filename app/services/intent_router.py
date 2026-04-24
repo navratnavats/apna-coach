@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from typing import Any
-
-import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
@@ -15,6 +11,7 @@ from app.services.intent_contract import (
     normalize_router_result,
 )
 from app.services.agent_trace import log_agent_event
+from app.services.llm_contract_runner import run_json_contract
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 MAX_ROUTER_RETRIES = 3
@@ -61,7 +58,7 @@ async def classify_router_intent(
         "- plan_create_request: asks for multi-day/week/month diet/workout plan.\n"
         "- plan_status_query: asks what current plan says for tomorrow/this week/next.\n"
         "- plan_edit_request: explicitly asks to edit or adjust existing plan.\n"
-        "- plan_change_signal: life event impacting plan (vacation, missed day, travel, injury flare).\n"
+        "- plan_change_signal: life event impacting plan where user implies/asks plan adjustment (vacation, missed day, travel, schedule disruption).\n"
         "- nutrition_log: user logs food intake.\n"
         "- activity_log: user logs physical activity done.\n"
         "- historical_query: asks what was eaten/done on past day/date.\n"
@@ -71,22 +68,13 @@ async def classify_router_intent(
         "- 'Aaj 2 roti khayi' is nutrition_log, not plan_create_request.\n"
         "- 'Next week plan dikhao' is plan_status_query, not workout_request.\n"
         "- 'Deficit 900 safe hai?' is metric_explanation_query, not burn_query.\n"
+        "- 'I forgot to mention: I have knee pain' is profile_update unless user asks to change plan.\n"
         "Retry contract:\n"
         "- If retry_context is provided, you MUST fix prior failure reason and avoid repeating the same mistake.\n"
         "- Keep output concise and strictly schema-valid JSON."
     )
 
-    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         usage = extract_gemini_usage(response)
         enqueue_llm_call_event(
             operation_id=trace_id,
@@ -98,10 +86,10 @@ async def classify_router_intent(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=usage,
         )
-        raw = json.loads((response.text or "{}").strip())
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
         intent = str(raw.get("primary_intent") or "").strip()
         if intent not in ALLOWED_ROUTER_INTENTS:
             raise ValueError(f"invalid_intent:{intent or 'empty'}")
@@ -110,43 +98,31 @@ async def classify_router_intent(
             raise ValueError(f"invalid_confidence:{confidence or 'empty'}")
         return normalize_router_result({"primary_intent": intent, "confidence": confidence})
 
-    previous_error = ""
-    previous_result: dict[str, Any] | None = None
-    for attempt in range(1, MAX_ROUTER_RETRIES + 1):
-        payload = {
-            "user_message": user_message,
-            "retry_context": (
-                {
-                    "attempt": attempt,
-                    "previous_failure_reason": previous_error,
-                    "previous_output": previous_result or {},
-                    "instruction": "Do not repeat previous invalid output; fix specifically for previous_failure_reason.",
-                }
-                if attempt > 1
-                else {}
-            ),
-        }
-        try:
-            result = await asyncio.to_thread(_call_model, payload)
-            if previous_result == result:
-                raise ValueError("repeated_same_output")
-            log_agent_event(
-                agent="router",
-                stage="retry_success" if attempt > 1 else "complete",
-                trace_id=trace_id,
-                details={**result, "attempt": attempt},
-            )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            previous_error = str(exc)
-            log_agent_event(
-                agent="router",
-                stage="retry_failed",
-                status="warn",
-                trace_id=trace_id,
-                details={"attempt": attempt, "reason": previous_error[:200]},
-            )
-            previous_result = previous_result or {}
+    try:
+        result = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_ROUTER_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+        log_agent_event(
+            agent="router",
+            stage="complete",
+            trace_id=trace_id,
+            details=result,
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        previous_error = str(exc)
+        log_agent_event(
+            agent="router",
+            stage="retry_failed",
+            status="warn",
+            trace_id=trace_id,
+            details={"attempt": MAX_ROUTER_RETRIES, "reason": previous_error[:200]},
+        )
 
     intent = _fallback_intent(user_message)
     result = {"primary_intent": intent, "confidence": "fallback"}

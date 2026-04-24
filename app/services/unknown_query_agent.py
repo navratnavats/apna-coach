@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from typing import Any
-
-import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
+from app.services.llm_contract_runner import run_json_contract
 from app.services.messages import unknown_query_clarifier
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
@@ -71,17 +67,7 @@ async def build_unknown_intent_contract(
         "- If retry_context exists, fix previous schema/output issue and do not repeat it."
     )
 
-    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         enqueue_llm_call_event(
             operation_id=trace_id,
             trace_id=trace_id,
@@ -92,12 +78,10 @@ async def build_unknown_intent_contract(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=extract_gemini_usage(response),
         )
-        raw = json.loads((response.text or "{}").strip())
-        if not isinstance(raw, dict):
-            raise ValueError("invalid_json_object")
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
         question = str(raw.get("clarify_question") or "").strip()
         if len(question) < 8:
             raise ValueError("invalid_clarify_question")
@@ -116,36 +100,24 @@ async def build_unknown_intent_contract(
             "safe_mode": safe_mode,
         }
 
-    previous_error = ""
-    previous_output: dict[str, Any] = {}
-    for attempt in range(1, MAX_UNKNOWN_RETRIES + 1):
-        payload = {
-            "user_message": user_message,
-            "retry_context": (
-                {
-                    "attempt": attempt,
-                    "previous_failure_reason": previous_error,
-                    "previous_output": previous_output,
-                    "instruction": "Fix prior output and return strict schema-valid JSON.",
-                }
-                if attempt > 1
-                else {}
-            ),
-        }
-        try:
-            result = await asyncio.to_thread(_call_model, payload)
-            if result == previous_output and attempt > 1:
-                raise ValueError("repeated_same_output")
-            log_agent_event(
-                agent="unknown_query_agent",
-                stage="complete",
-                trace_id=trace_id,
-                details={"mode": "clarifier", "safe_mode": result.get("safe_mode")},
-            )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            previous_error = str(exc)
-            previous_output = previous_output or {}
+    try:
+        result = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_UNKNOWN_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+        log_agent_event(
+            agent="unknown_query_agent",
+            stage="complete",
+            trace_id=trace_id,
+            details={"mode": "clarifier", "safe_mode": result.get("safe_mode")},
+        )
+        return result
+    except Exception:  # noqa: BLE001
+        pass
 
     payload = fallback_payload
     log_agent_event(

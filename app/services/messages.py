@@ -161,6 +161,13 @@ def onboarding_restart_done(address: str) -> str:
     )
 
 
+def injury_saved_plan_adjust_prompt() -> str:
+    return (
+        "Injury/medical update save kar diya. "
+        "Kya iske basis pe plan adjust kar du? Reply with Yes/No."
+    )
+
+
 def onboarding_help(address: str) -> str:
     return (
         f"{address}, onboarding quick commands (Hinglish friendly):\n"
@@ -273,6 +280,40 @@ def graduation_generic(address: str) -> str:
     return (
         f"Stats locked in {address}. Profile complete ho gaya. Ab se har din "
         "main aapko data-driven plan aur feedback dunga. 💪"
+    )
+
+
+def onboarding_completion_overview(
+    address: str,
+    *,
+    profile_lines: list[str],
+) -> str:
+    details_block = "\n".join([f"- {line}" for line in profile_lines if line.strip()]) or "- Profile captured"
+    capabilities_block = "\n".join(
+        [
+            "- Food logging (text/voice/image) with estimated calories/macros",
+            "- Activity/workout logging with estimated calorie burn",
+            "- Daily deficit and metric explanations (factual from your logs)",
+            "- Personalized workout guidance based on injuries and equipment",
+            "- Plan create/edit/status support",
+            "- Historical recall for previous logged days",
+        ]
+    )
+    limits_block = "\n".join(
+        [
+            "- Not a medical diagnosis service",
+            "- Nutrition/burn values are estimates, not lab measurements",
+        ]
+    )
+    return (
+        f"{address}, onboarding complete. Ye details maine save kar li:\n"
+        f"{details_block}\n\n"
+        "Main kya kya kar sakta hoon:\n"
+        f"{capabilities_block}\n\n"
+        "Known limits (honest):\n"
+        f"{limits_block}\n\n"
+        "Ye intro main ek hi baar auto bhejta hoon. Baad me jab chahe pucho: "
+        "'app features' ya 'what can you do'."
     )
 
 

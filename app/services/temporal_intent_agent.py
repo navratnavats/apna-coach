@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from typing import Any
-
-import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.llm_contract_runner import run_json_contract
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 MAX_TEMPORAL_RETRIES = 3
@@ -91,17 +87,7 @@ async def parse_temporal_intent(
     }
     allowed_conf = {"high", "medium", "low"}
 
-    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         enqueue_llm_call_event(
             operation_id=trace_id,
             trace_id=trace_id,
@@ -112,12 +98,10 @@ async def parse_temporal_intent(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=extract_gemini_usage(response),
         )
-        raw = json.loads((response.text or "{}").strip())
-        if not isinstance(raw, dict):
-            raise ValueError("invalid_json_object")
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
         time_ref = str(raw.get("time_ref_type") or "").strip().lower()
         if time_ref not in allowed_time_ref:
             raise ValueError("invalid_time_ref")
@@ -139,28 +123,14 @@ async def parse_temporal_intent(
             "confidence": conf,
         }
 
-    previous_error = ""
-    previous_output: dict[str, Any] = {}
-    for attempt in range(1, MAX_TEMPORAL_RETRIES + 1):
-        payload = {
-            "user_text": user_text,
-            "timezone": timezone_name,
-            "retry_context": (
-                {
-                    "attempt": attempt,
-                    "previous_failure_reason": previous_error,
-                    "previous_output": previous_output,
-                }
-                if attempt > 1
-                else {}
-            ),
-        }
-        try:
-            result = await asyncio.to_thread(_call_model, payload)
-            if result == previous_output and attempt > 1:
-                raise ValueError("repeated_same_output")
-            return result
-        except Exception as exc:  # noqa: BLE001
-            previous_error = str(exc)
-            previous_output = previous_output or {}
-    return {}
+    try:
+        return await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_text": user_text, "timezone": timezone_name},
+            max_retries=MAX_TEMPORAL_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+    except Exception:  # noqa: BLE001
+        return {}

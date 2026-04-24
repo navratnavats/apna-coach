@@ -20,6 +20,7 @@ from app.services.messages import (
     coach_missing_equipment,
 )
 from app.services.medical_safety_officer import run_medical_safety_officer
+from app.services.llm_contract_runner import run_json_contract
 from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 from app.services.intent_contract import (
@@ -238,17 +239,7 @@ async def _infer_training_environment_from_query(
         "Use unknown when unclear."
     )
 
-    def _call_model(payload: dict[str, Any]) -> tuple[str, str]:
-        started_at = time.perf_counter()
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            json.dumps(payload, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         enqueue_llm_call_event(
             operation_id=trace_id,
             trace_id=trace_id,
@@ -259,10 +250,10 @@ async def _infer_training_environment_from_query(
             model=GEMINI_COACH_MODEL,
             latency_ms=elapsed_ms,
             request_payload=payload,
-            response_text=response.text or "",
+            response_text=response_text,
             usage=extract_gemini_usage(response),
         )
-        parsed = json.loads((response.text or "{}").strip())
+    def _validate(parsed: dict[str, Any]) -> tuple[str, str]:
         env = str(parsed.get("environment") or "unknown").strip().lower()
         conf = str(parsed.get("confidence") or "low").strip().lower()
         if env not in {"home", "gym", "both", "unknown"}:
@@ -271,27 +262,17 @@ async def _infer_training_environment_from_query(
             raise ValueError(f"invalid_confidence:{conf or 'empty'}")
         return (env, conf)
 
-    previous_error = ""
-    previous_output: dict[str, Any] = {}
-    for attempt in range(1, MAX_COACH_RETRIES + 1):
-        payload = {
-            "user_message": user_message,
-            "retry_context": (
-                {
-                    "attempt": attempt,
-                    "previous_failure_reason": previous_error,
-                    "previous_output": previous_output,
-                    "instruction": "Fix previous failure reason and return strict JSON with environment and confidence.",
-                }
-                if attempt > 1
-                else {}
-            ),
-        }
-        try:
-            return await asyncio.to_thread(_call_model, payload)
-        except Exception as exc:  # noqa: BLE001
-            previous_error = str(exc)
-    return ("unknown", "low")
+    try:
+        return await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_COACH_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
+    except Exception:  # noqa: BLE001
+        return ("unknown", "low")
 
 
 async def _generate_workout_program(
