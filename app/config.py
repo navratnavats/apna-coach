@@ -47,8 +47,8 @@ CHECKIN_MESSAGE: str = os.getenv(
 DIETITIAN_REVIEW_ENABLED: bool = (
     os.getenv("DIETITIAN_REVIEW_ENABLED", "true").lower() == "true"
 )
-DIETITIAN_REVIEW_HOUR: int = int(os.getenv("DIETITIAN_REVIEW_HOUR", "21"))
-DIETITIAN_REVIEW_MINUTE: int = int(os.getenv("DIETITIAN_REVIEW_MINUTE", "30"))
+DIETITIAN_REVIEW_HOUR: int = int(os.getenv("DIETITIAN_REVIEW_HOUR", "22"))
+DIETITIAN_REVIEW_MINUTE: int = int(os.getenv("DIETITIAN_REVIEW_MINUTE", "0"))
 SCHEDULER_TIMEZONE: str = os.getenv("SCHEDULER_TIMEZONE", "Asia/Kolkata")
 
 # Morning Workout Nudge settings.

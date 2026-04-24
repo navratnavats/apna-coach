@@ -21,6 +21,8 @@ from app.config import (
 from app.services.agent_trace import log_agent_event
 from app.services.persona import resolve_user_address
 
+MAX_MEMORY_RETRIES = 3
+
 
 def load_default_living_profile() -> dict[str, Any]:
     root_dir = Path(__file__).resolve().parents[2]
@@ -155,14 +157,14 @@ async def ai_memory_clerk(
         "source_hint": source_hint,
     }
 
-    def _call_model() -> dict[str, Any]:
+    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
         started_at = time.perf_counter()
         print(f"[AI] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL_3_1_FLASH, system_instruction=system_prompt
         )
         response = model.generate_content(
-            json.dumps(model_input, ensure_ascii=False),
+            json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
         )
         response_text = response.text or "{}"
@@ -178,7 +180,37 @@ async def ai_memory_clerk(
         )
         return parsed
 
-    return await asyncio.to_thread(_call_model)
+    previous_error = ""
+    previous_output: dict[str, Any] = {}
+    for attempt in range(1, MAX_MEMORY_RETRIES + 1):
+        payload = {
+            **model_input,
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "previous_output": previous_output,
+                    "instruction": "Fix previous failure reason and return strict schema-valid JSON only.",
+                }
+                if attempt > 1
+                else {}
+            ),
+        }
+        try:
+            result = await asyncio.to_thread(_call_model, payload)
+            if result == previous_output and attempt > 1:
+                raise ValueError("repeated_same_output")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            log_agent_event(
+                agent="memory_clerk",
+                stage="retry_failed",
+                status="warn",
+                trace_id=trace_id,
+                details={"attempt": attempt, "reason": previous_error[:200]},
+            )
+    return {}
 
 
 def _download_media_bytes(media_url: str) -> bytes:
@@ -241,7 +273,7 @@ async def ai_nutrition_from_image(
         "Do not output markdown. Do not include any extra text."
     )
 
-    def _call_model() -> dict[str, Any]:
+    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
         started_at = time.perf_counter()
         print(f"[AI Vision] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
         image_bytes = _download_media_bytes(image_url)
@@ -255,7 +287,7 @@ async def ai_nutrition_from_image(
                     "mime_type": "image/jpeg",
                     "data": image_bytes,
                 },
-                json.dumps({"current_profile": current_profile}, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
             ],
             generation_config={"response_mime_type": "application/json"},
         )
@@ -275,7 +307,37 @@ async def ai_nutrition_from_image(
         )
         return parsed
 
-    return await asyncio.to_thread(_call_model)
+    previous_error = ""
+    previous_output: dict[str, Any] = {}
+    for attempt in range(1, MAX_MEMORY_RETRIES + 1):
+        payload = {
+            "current_profile": current_profile,
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "previous_output": previous_output,
+                    "instruction": "Fix previous failure and return strict JSON with status/category/food_log_entry.",
+                }
+                if attempt > 1
+                else {}
+            ),
+        }
+        try:
+            result = await asyncio.to_thread(_call_model, payload)
+            if result == previous_output and attempt > 1:
+                raise ValueError("repeated_same_output")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            log_agent_event(
+                agent="nutritionist",
+                stage="vision_retry_failed",
+                status="warn",
+                trace_id=trace_id,
+                details={"attempt": attempt, "reason": previous_error[:200]},
+            )
+    return {}
 
 
 async def ai_transcribe_voice_note(
@@ -309,7 +371,7 @@ async def ai_transcribe_voice_note(
         "No markdown. No extra keys unless needed."
     )
 
-    def _call_model() -> dict[str, Any]:
+    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
         started_at = time.perf_counter()
         print(f"[AI Audio] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
         audio_bytes = _download_media_bytes(media_url)
@@ -320,6 +382,7 @@ async def ai_transcribe_voice_note(
         response = model.generate_content(
             [
                 {"mime_type": media_content_type, "data": audio_bytes},
+                json.dumps(payload, ensure_ascii=False),
             ],
             generation_config={"response_mime_type": "application/json"},
         )
@@ -344,7 +407,36 @@ async def ai_transcribe_voice_note(
         )
         return parsed
 
-    return await asyncio.to_thread(_call_model)
+    previous_error = ""
+    previous_output: dict[str, Any] = {}
+    for attempt in range(1, MAX_MEMORY_RETRIES + 1):
+        payload = {
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "previous_output": previous_output,
+                    "instruction": "Fix previous failure and return strict JSON with transcript.",
+                }
+                if attempt > 1
+                else {}
+            )
+        }
+        try:
+            result = await asyncio.to_thread(_call_model, payload)
+            if result == previous_output and attempt > 1:
+                raise ValueError("repeated_same_output")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            log_agent_event(
+                agent="memory_clerk",
+                stage="voice_transcribe_retry_failed",
+                status="warn",
+                trace_id=trace_id,
+                details={"attempt": attempt, "reason": previous_error[:200]},
+            )
+    return {}
 
 
 def next_onboarding_prompt(profile: dict[str, Any]) -> str:

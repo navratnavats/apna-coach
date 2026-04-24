@@ -17,6 +17,7 @@ from app.config import (
 from app.services.agent_trace import log_agent_event
 from app.services.dietitian_review import generate_dietitian_review
 from app.services.eod_compression import compress_today_for_archive
+from app.services.historical_archive import upsert_historical_day
 from app.services.morning_programmer import generate_morning_workout_nudge
 from app.services.persona import resolve_user_address
 from app.services.twilio_messaging import send_whatsapp_message
@@ -100,19 +101,13 @@ async def run_dietitian_review_job() -> None:
                     trace_id=trace_id,
                 )
                 if archive_payload is not None:
-                    archive_insert = (
-                        supabase.table("historical_archive")
-                        .insert(
-                            {
-                                "phone_number": phone_number,
-                                "archive_date": archive_payload.get("date"),
-                                "summary_line": archive_payload.get("summary_line"),
-                                "metrics": archive_payload.get("metrics"),
-                                "nutrition_entries": archive_payload.get("nutrition_entries"),
-                                "activity_entries": archive_payload.get("activity_entries"),
-                            }
-                        )
-                        .execute()
+                    upsert_historical_day(
+                        phone_number=phone_number,
+                        archive_date=str(archive_payload.get("date") or ""),
+                        summary_line=str(archive_payload.get("summary_line") or ""),
+                        metrics=archive_payload.get("metrics") or {},
+                        nutrition_entries=archive_payload.get("nutrition_entries") or [],
+                        activity_entries=archive_payload.get("activity_entries") or [],
                     )
                     (
                         supabase.table("users")
@@ -126,7 +121,7 @@ async def run_dietitian_review_job() -> None:
                         trace_id=trace_id,
                         details={
                             "date": archive_payload.get("date"),
-                            "archive_inserted": bool(archive_insert.data),
+                            "archive_upserted": True,
                         },
                     )
             except Exception as exc:  # noqa: BLE001

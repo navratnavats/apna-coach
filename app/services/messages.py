@@ -53,6 +53,17 @@ def policy_out_of_scope() -> str:
     )
 
 
+def unknown_query_clarifier(address: str) -> str:
+    return (
+        f"{address}, mujhe message exact clear nahi hua. Ek line me bolo aapko kya chahiye:\n"
+        "- aaj ka burn/deficit numbers\n"
+        "- aaj kya khaya (food recall)\n"
+        "- workout plan\n"
+        "- existing plan edit/status\n"
+        "- profile update"
+    )
+
+
 def onboarding_missing_biometrics() -> str:
     return "Onboarding almost done. Bas ek final cheez: height, age, aur gender clear kijiye."
 
@@ -131,6 +142,15 @@ def onboarding_policy_redirect(address: str, pending_fields: list[str]) -> str:
         "Quick options: 'kya bacha hai / what is left', 'onboarding status', "
         "'is step ka matlab / what does this step mean', "
         "'onboarding edit', 'onboarding restart'."
+    )
+
+
+def onboarding_capability_locked(address: str, pending_fields: list[str]) -> str:
+    pending = _render_onboarding_fields(pending_fields)
+    return (
+        f"{address}, main features detail me onboarding complete hote hi share karunga.\n"
+        f"Abhi pehle ye fields complete karte hain:\n{pending}\n"
+        "Aap ek message ya chunks me details bhej sakte ho."
     )
 
 
