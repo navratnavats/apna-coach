@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import google.generativeai as genai
 
@@ -18,7 +20,15 @@ from app.services.messages import (
     coach_missing_equipment,
 )
 from app.services.medical_safety_officer import run_medical_safety_officer
+from app.services.llm_contract_runner import run_json_contract
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
+from app.services.intent_contract import (
+    classify_heuristic_intent,
+    should_allow_detector_fallback,
+)
+
+MAX_COACH_RETRIES = 3
 
 
 def _get_available_equipment(living_profile: dict[str, Any]) -> list[str]:
@@ -40,71 +50,179 @@ def _get_training_environment(living_profile: dict[str, Any]) -> str:
     return env
 
 
-def _is_burn_or_deficit_query(user_message: str) -> bool:
-    text = str(user_message or "").strip().lower()
-    if not text:
-        return False
-    calorie_terms = (
-        "calorie",
-        "calories",
-        "kcal",
-        "burn",
-        "burnt",
-        "deficit",
-        "net",
-    )
-    activity_terms = ("run", "running", "walk", "steps", "swim", "cycling", "workout")
-    question_terms = ("how much", "kitna", "kitni", "today", "aaj")
-    has_calorie_context = any(term in text for term in calorie_terms)
-    has_question = any(term in text for term in question_terms)
-    has_activity_hint = any(term in text for term in activity_terms)
-    return has_calorie_context and (has_question or has_activity_hint)
-
-
-def _is_metric_explanation_query(user_message: str) -> bool:
-    text = str(user_message or "").strip().lower()
-    if not text:
-        return False
-    has_metric_word = any(
-        k in text for k in ("deficit", "tdee", "maintenance", "budget", "target")
-    )
-    has_meaning_word = any(
-        k in text for k in ("matlab", "mean", "kya", "safe", "sahi", "zyada", "kam")
-    )
-    return has_metric_word and has_meaning_word
-
-
-async def _detect_workout_intent(user_message: str) -> bool:
-    """
-    AI intent detector to avoid brittle keyword-only routing.
-    """
-    if not GEMINI_API_KEY:
-        return False
-
-    system_prompt = (
-        "Classify if the user's message is asking for workout/training plan or "
-        "exercise advice. Return ONLY JSON: {\"is_workout_request\": true/false}."
-    )
-
-    def _call_model() -> bool:
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            user_message,
-            generation_config={"response_mime_type": "application/json"},
-        )
-        parsed = json.loads((response.text or "{}").strip())
-        return bool(parsed.get("is_workout_request", False))
-
+def _today_food_entries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    logs = living_profile.get("logs") or {}
+    raw = logs.get("nutrition_log") or []
+    if not isinstance(raw, list):
+        return []
+    identity = living_profile.get("identity") or {}
+    tz_name = str(identity.get("timezone") or "Asia/Kolkata").strip()
     try:
-        return await asyncio.to_thread(_call_model)
-    except Exception:  # noqa: BLE001
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    today_local = datetime.now(tz).date()
+    entries: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        local_date = str(item.get("local_date") or "").strip()
+        if local_date:
+            if local_date == today_local.isoformat():
+                entries.append(item)
+            continue
+        logged_at = str(item.get("logged_at") or "").strip()
+        if not logged_at:
+            entries.append(item)
+            continue
+        try:
+            dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
+            if dt.astimezone(tz).date() == today_local:
+                entries.append(item)
+        except Exception:
+            entries.append(item)
+    return entries
+
+
+def _today_activity_entries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    logs = living_profile.get("logs") or {}
+    raw = logs.get("activity_log") or []
+    if not isinstance(raw, list):
+        return []
+    identity = living_profile.get("identity") or {}
+    tz_name = str(identity.get("timezone") or "Asia/Kolkata").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    today_local = datetime.now(tz).date()
+    entries: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        local_date = str(item.get("local_date") or "").strip()
+        if local_date:
+            if local_date == today_local.isoformat():
+                entries.append(item)
+            continue
+        logged_at = str(item.get("logged_at") or "").strip()
+        if not logged_at:
+            entries.append(item)
+            continue
+        try:
+            dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
+            if dt.astimezone(tz).date() == today_local:
+                entries.append(item)
+        except Exception:
+            entries.append(item)
+    return entries
+
+
+def _is_activity_recall_query(user_message: str) -> bool:
+    text = str(user_message or "").strip().lower()
+    if not text:
         return False
+    activity_words = ("workout", "exercise", "activity", "training", "run", "walk", "gym")
+    recall_words = ("what did i do", "kya kiya", "done today", "aaj kya", "session")
+    return any(a in text for a in activity_words) and any(r in text for r in recall_words)
 
 
-async def _infer_training_environment_from_query(user_message: str) -> tuple[str, str]:
+def _build_activity_recall_reply(user_message: str, living_profile: dict[str, Any], address: str) -> str:
+    text = str(user_message or "").strip().lower()
+    entries = _today_activity_entries(living_profile)
+    if not entries:
+        return f"{address}, aaj ka activity/workout log abhi empty hai."
+
+    slot = ""
+    if any(k in text for k in ("morning", "subah")):
+        slot = "morning_session"
+    elif any(k in text for k in ("afternoon", "dopahar", "noon")):
+        slot = "afternoon_session"
+    elif any(k in text for k in ("evening", "shaam", "night")):
+        slot = "evening_session"
+
+    if slot:
+        slot_entries = [e for e in entries if str(e.get("session_slot") or "").strip().lower() == slot]
+        if not slot_entries:
+            return f"{address}, aaj {slot.replace('_', ' ')} me koi activity log nahi mila."
+        entries = slot_entries
+
+    lines = []
+    total_burn = 0
+    for entry in entries[:8]:
+        name = str(entry.get("name") or entry.get("summary") or "activity").strip()
+        dur = int(float(entry.get("duration_mins") or 0))
+        burn = int(float(entry.get("burn_cals") or 0))
+        total_burn += burn
+        if dur > 0:
+            lines.append(f"- {name} ({dur} min, {burn} kcal)")
+        else:
+            lines.append(f"- {name} ({burn} kcal)")
+    return (
+        f"{address}, aaj ke activity logs:\n"
+        + "\n".join(lines)
+        + f"\nTotal active burn (logged): {total_burn} kcal."
+    )
+
+
+def _build_food_recall_reply(user_message: str, living_profile: dict[str, Any], address: str) -> str:
+    text = str(user_message or "").strip().lower()
+    entries = _today_food_entries(living_profile)
+    if not entries:
+        return f"{address}, aaj ka food log abhi empty hai. Jo bhi khaya ho, text/photo/voice me bhej do."
+
+    meal_slot = ""
+    if any(k in text for k in ("breakfast", "nashta")):
+        meal_slot = "breakfast"
+    elif "lunch" in text:
+        meal_slot = "lunch"
+    elif any(k in text for k in ("dinner", "raat")):
+        meal_slot = "dinner"
+    elif "snack" in text:
+        meal_slot = "evening_snack"
+
+    if meal_slot:
+        meal_entries = [e for e in entries if str(e.get("meal_slot") or "").strip().lower() == meal_slot]
+        if not meal_entries:
+            meal_entries = [
+                e
+                for e in entries
+                if meal_slot in str(e.get("summary") or "").strip().lower()
+            ]
+        if not meal_entries:
+            return f"{address}, aaj {meal_slot.replace('_', ' ')} tag ke saath koi entry nahi mili."
+        lines = []
+        total = 0
+        for entry in meal_entries[:6]:
+            summary = str(entry.get("summary") or "meal").strip()
+            cals = int(float(entry.get("estimated_calories") or 0))
+            total += cals
+            lines.append(f"- {summary} ({cals} kcal)")
+        return (
+            f"{address}, aaj {meal_slot.replace('_', ' ')} me:\n"
+            + "\n".join(lines)
+            + f"\nTotal: {total} kcal."
+        )
+
+    lines = []
+    total = 0
+    for entry in entries[:10]:
+        summary = str(entry.get("summary") or "meal").strip()
+        cals = int(float(entry.get("estimated_calories") or 0))
+        total += cals
+        lines.append(f"- {summary} ({cals} kcal)")
+    return (
+        f"{address}, aaj ke logged meals ye hain:\n"
+        + "\n".join(lines)
+        + f"\nTotal intake (logged): {total} kcal."
+    )
+
+
+async def _infer_training_environment_from_query(
+    user_message: str,
+    *,
+    trace_id: str | None = None,
+) -> tuple[str, str]:
     """
     LLM-based environment mapping from user's workout query.
     Returns (environment, confidence) where environment is one of:
@@ -121,32 +239,47 @@ async def _infer_training_environment_from_query(user_message: str) -> tuple[str
         "Use unknown when unclear."
     )
 
-    def _call_model() -> tuple[str, str]:
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="coach",
+            stage="infer_training_environment",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response_text,
+            usage=extract_gemini_usage(response),
         )
-        response = model.generate_content(
-            user_message,
-            generation_config={"response_mime_type": "application/json"},
-        )
-        parsed = json.loads((response.text or "{}").strip())
+    def _validate(parsed: dict[str, Any]) -> tuple[str, str]:
         env = str(parsed.get("environment") or "unknown").strip().lower()
         conf = str(parsed.get("confidence") or "low").strip().lower()
         if env not in {"home", "gym", "both", "unknown"}:
-            env = "unknown"
+            raise ValueError(f"invalid_environment:{env or 'empty'}")
         if conf not in {"high", "medium", "low"}:
-            conf = "low"
+            raise ValueError(f"invalid_confidence:{conf or 'empty'}")
         return (env, conf)
 
     try:
-        return await asyncio.to_thread(_call_model)
+        return await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_COACH_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
     except Exception:  # noqa: BLE001
         return ("unknown", "low")
 
 
 async def _generate_workout_program(
-    user_message: str, living_profile: dict[str, Any]
+    user_message: str,
+    living_profile: dict[str, Any],
+    *,
+    trace_id: str | None = None,
 ) -> str:
     """
     Specialist Workout Programmer agent (Hybrid Training).
@@ -166,21 +299,62 @@ async def _generate_workout_program(
         "- Output plain text only."
     )
 
-    def _call_model() -> str:
+    def _call_model(payload: dict[str, Any]) -> str:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
         )
         response = model.generate_content(
-            json.dumps(
-                {"living_profile": living_profile, "user_message": user_message},
-                ensure_ascii=False,
-            ),
+            json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "text/plain"},
         )
-        return (response.text or "").strip()
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="workout_programmer",
+            stage="generate_quick_hit",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
+        )
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("empty_workout_program")
+        return text
 
-    return await asyncio.to_thread(_call_model)
+    previous_error = ""
+    previous_output = ""
+    for attempt in range(1, MAX_COACH_RETRIES + 1):
+        payload = {
+            "living_profile": living_profile,
+            "user_message": user_message,
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "previous_output": previous_output,
+                    "instruction": "Do not repeat previous failure. Return concise workout plain text.",
+                }
+                if attempt > 1
+                else {}
+            ),
+        }
+        try:
+            output = await asyncio.to_thread(_call_model, payload)
+            if output == previous_output and attempt > 1:
+                raise ValueError("repeated_same_output")
+            return output
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            if "output" in locals() and isinstance(output, str):
+                previous_output = output
+    return ""
 
 
 def _should_add_motivation_reminder(living_profile: dict[str, Any]) -> bool:
@@ -233,7 +407,10 @@ async def _finalize_with_critic(
     source: str,
     living_profile: dict[str, Any] | None = None,
     trace_id: str | None = None,
+    apply_critic: bool = True,
 ) -> str:
+    if not apply_critic:
+        return _sanitize_coach_reply(draft_text)
     polished = await run_critic_agent(
         draft_text,
         source=source,
@@ -290,13 +467,40 @@ async def generate_coach_reply(
         return _sanitize_coach_reply(coach_historical_not_found(address))
 
     routed_intent = str(session.get("routed_intent") or "").strip().lower()
+    router_confidence = str(session.get("router_confidence") or "low").strip().lower()
+    allow_fallback_detectors = should_allow_detector_fallback(router_confidence)
+    heuristic_intent = (
+        classify_heuristic_intent(user_message) if allow_fallback_detectors else "general_chat"
+    )
     burn_query_routed = routed_intent == "burn_query"
     metric_explain_routed = routed_intent == "metric_explanation_query"
-    burn_query_fallback = _is_burn_or_deficit_query(user_message)
-    metric_explain_fallback = _is_metric_explanation_query(user_message)
+    food_recall_routed = routed_intent == "food_recall_query"
+    burn_query_fallback = heuristic_intent == "burn_query"
+    metric_explain_fallback = heuristic_intent == "metric_explanation_query"
+    food_recall_fallback = heuristic_intent == "food_recall_query"
     is_burn_query = burn_query_routed or burn_query_fallback
     is_metric_explain_query = metric_explain_routed or metric_explain_fallback
+    is_food_recall = food_recall_routed or food_recall_fallback
     is_factual_query = is_burn_query or is_metric_explain_query
+
+    if is_food_recall:
+        recall_reply = _build_food_recall_reply(user_message, living_profile, address)
+        return await _finalize_with_critic(
+            recall_reply,
+            source="coach_food_recall",
+            living_profile=living_profile,
+            trace_id=trace_id,
+            apply_critic=False,
+        )
+    if _is_activity_recall_query(user_message):
+        activity_reply = _build_activity_recall_reply(user_message, living_profile, address)
+        return await _finalize_with_critic(
+            activity_reply,
+            source="coach_activity_recall",
+            living_profile=living_profile,
+            trace_id=trace_id,
+            apply_critic=False,
+        )
 
     logs = living_profile.get("logs") or {}
     current_day = logs.get("current_day") or {}
@@ -342,6 +546,7 @@ async def generate_coach_reply(
             source="coach_metric_explain",
             living_profile=living_profile,
             trace_id=trace_id,
+            apply_critic=False,
         )
 
     if is_burn_query:
@@ -358,11 +563,12 @@ async def generate_coach_reply(
             source="coach_burn_query",
             living_profile=living_profile,
             trace_id=trace_id,
+            apply_critic=False,
         )
 
-    is_workout_request = False
-    if not is_factual_query:
-        is_workout_request = await _detect_workout_intent(user_message)
+    is_workout_request = routed_intent == "workout_request"
+    if not is_workout_request and (not is_factual_query) and allow_fallback_detectors:
+        is_workout_request = heuristic_intent == "workout_request"
     log_agent_event(
         agent="coach",
         stage="intent_detected",
@@ -371,7 +577,10 @@ async def generate_coach_reply(
             "is_workout_request": is_workout_request,
             "is_burn_query": is_burn_query,
             "is_metric_explain_query": is_metric_explain_query,
+            "is_food_recall": is_food_recall,
             "routed_intent": routed_intent or "none",
+            "router_confidence": router_confidence or "none",
+            "allow_fallback_detectors": allow_fallback_detectors,
         },
     )
     equipment_list = _get_available_equipment(living_profile)
@@ -389,7 +598,10 @@ async def generate_coach_reply(
         )
 
     if is_workout_request and not training_env:
-        inferred_env, inferred_conf = await _infer_training_environment_from_query(user_message)
+        inferred_env, inferred_conf = await _infer_training_environment_from_query(
+            user_message,
+            trace_id=trace_id,
+        )
         log_agent_event(
             agent="coach",
             stage="training_env_inferred",
@@ -422,7 +634,11 @@ async def generate_coach_reply(
     # Specialist handoff: for workout requests with equipment available,
     # route to Workout Programmer agent prompt.
     if is_workout_request:
-        workout_text = await _generate_workout_program(user_message, living_profile)
+        workout_text = await _generate_workout_program(
+            user_message,
+            living_profile,
+            trace_id=trace_id,
+        )
         if workout_text.strip():
             reviewed_workout = await run_medical_safety_officer(
                 workout_text,
@@ -524,6 +740,19 @@ async def generate_coach_reply(
         )
         reply_text = (response.text or "").strip()
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="coach",
+            stage="generate_reply",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=model_input,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
+        )
         print(f"[Coach] Response received in {elapsed_ms} ms (chars={len(reply_text)})")
         return reply_text
 

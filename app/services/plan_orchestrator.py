@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.clients.supabase_client import supabase
+from app.services.runtime_cache import MISSING, get_cached, invalidate_cached, set_cached
 
 PLAN_INTENTS = {
     "plan_create_request",
@@ -161,6 +162,10 @@ def _build_week_blocks_from_actions(day_actions: list[str]) -> list[dict[str, An
 
 
 def fetch_latest_plan_version(phone_number: str) -> dict[str, Any] | None:
+    cache_key = f"plan_latest:{phone_number}"
+    cached = get_cached(cache_key)
+    if cached is not MISSING:
+        return cached
     response = (
         supabase.table("plan_versions")
         .select("plan_id,version,plan_payload,status,change_reason,created_at")
@@ -171,9 +176,12 @@ def fetch_latest_plan_version(phone_number: str) -> dict[str, Any] | None:
     )
     rows = response.data or []
     if not rows:
+        set_cached(cache_key, None, ttl_seconds=20)
         return None
     row = rows[0] or {}
-    return row if isinstance(row, dict) else None
+    result = row if isinstance(row, dict) else None
+    set_cached(cache_key, result, ttl_seconds=20)
+    return result
 
 
 def persist_plan_version(
@@ -234,6 +242,7 @@ def persist_plan_version(
         )
         .execute()
     )
+    invalidate_cached(f"plan_latest:{phone_number}")
     active["plan_id"] = current_plan_id
     active["version"] = new_version
     active["status"] = "active"

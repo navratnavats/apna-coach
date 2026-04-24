@@ -19,7 +19,11 @@ from app.config import (
     TWILIO_AUTH_TOKEN,
 )
 from app.services.agent_trace import log_agent_event
+from app.services.llm_contract_runner import run_json_contract
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
+
+MAX_MEMORY_RETRIES = 3
 
 
 def load_default_living_profile() -> dict[str, Any]:
@@ -139,12 +143,21 @@ async def ai_memory_clerk(
         "- If activity is logged, return logs.activity_log as array of objects with keys: "
         "name, category(run|walk|cycling|swimming|strength_training|racquet_sport|team_sport|general_cardio), "
         "duration_mins, intensity(light|moderate|vigorous), met_score, rest_style(normal|no_rest|long_rest), "
-        "confidence, assumption_note.\n"
+        "confidence, assumption_note, intent_type(performed_event|habitual_context|future_plan|correction|unknown), "
+        "time_anchor(today|yesterday|explicit_datetime|none), completion_signal(true|false), safe_to_burn(true|false).\n"
+        "- Only include logs.activity_log entries when intent_type='performed_event'.\n"
+        "- For habitual context (e.g., usually/roz/karta hu), do not return logs.activity_log; "
+        "only update lifestyle fields.\n"
+        "- For future plan/request intent, do not return logs.activity_log.\n"
+        "- For low-detail completion statements without duration/intensity, set "
+        "logs.current_day.workout_complete=true and set safe_to_burn=false.\n"
         "- For strength training, if user does not specify rest style, default to rest_style='normal'.\n"
         "- If user says no rest/continuous workout, set rest_style='no_rest'.\n"
         "- If user is correcting a just-logged activity intensity/rest (e.g., 'no rest tha'), "
         "return logs.activity_adjustment object with keys like mode='recalculate_last' and "
         "rest_style='no_rest' so backend can recompute instead of double-counting.\n"
+        "- If user says previous activity was not a performed event (e.g., routine only), "
+        "return logs.activity_adjustment with mode='drop_last'.\n"
         "- Never remove existing logs. Return only additive updates.\n"
         "- If information is missing, do not invent it and do not include that key."
     )
@@ -155,30 +168,78 @@ async def ai_memory_clerk(
         "source_hint": source_hint,
     }
 
-    def _call_model() -> dict[str, Any]:
-        started_at = time.perf_counter()
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         print(f"[AI] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL_3_1_FLASH, system_instruction=system_prompt
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="memory_clerk",
+            stage="profile_extract",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response_text,
+            usage=usage,
         )
-        response = model.generate_content(
-            json.dumps(model_input, ensure_ascii=False),
-            generation_config={"response_mime_type": "application/json"},
-        )
-        response_text = response.text or "{}"
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         print(f"[AI] Response received in {elapsed_ms} ms (chars={len(response_text)})")
-        parsed = extract_json_from_model_text(response_text)
+    def _validate(parsed: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(parsed, dict):
+            raise ValueError("memory_clerk_invalid_object")
+        logs = parsed.get("logs")
+        if isinstance(logs, dict):
+            raw_activity_log = logs.get("activity_log")
+            normalized_activity: list[dict[str, Any]] = []
+            if isinstance(raw_activity_log, dict):
+                raw_activity_log = [raw_activity_log]
+            if isinstance(raw_activity_log, list):
+                for entry in raw_activity_log:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized = dict(entry)
+                    normalized["intent_type"] = str(
+                        normalized.get("intent_type") or "unknown"
+                    ).strip().lower()
+                    normalized["time_anchor"] = str(
+                        normalized.get("time_anchor") or "none"
+                    ).strip().lower()
+                    normalized["completion_signal"] = bool(
+                        normalized.get("completion_signal")
+                    )
+                    normalized["safe_to_burn"] = bool(normalized.get("safe_to_burn"))
+                    normalized_activity.append(normalized)
+                logs["activity_log"] = normalized_activity
+                parsed["logs"] = logs
         print(f"[AI] Parsed update keys: {sorted(parsed.keys())}")
+        return parsed
+
+    try:
+        result = await run_json_contract(
+            model_name=GEMINI_MODEL_3_1_FLASH,
+            system_prompt=system_prompt,
+            payload=model_input,
+            max_retries=MAX_MEMORY_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
         log_agent_event(
             agent="memory_clerk",
             stage="complete",
             trace_id=trace_id,
-            details={"update_keys": sorted(parsed.keys())},
+            details={"update_keys": sorted(result.keys())},
         )
-        return parsed
-
-    return await asyncio.to_thread(_call_model)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log_agent_event(
+            agent="memory_clerk",
+            stage="retry_failed",
+            status="warn",
+            trace_id=trace_id,
+            details={"attempt": MAX_MEMORY_RETRIES, "reason": str(exc)[:200]},
+        )
+        return {}
 
 
 def _download_media_bytes(media_url: str) -> bytes:
@@ -241,41 +302,95 @@ async def ai_nutrition_from_image(
         "Do not output markdown. Do not include any extra text."
     )
 
-    def _call_model() -> dict[str, Any]:
-        started_at = time.perf_counter()
+    image_bytes = await asyncio.to_thread(_download_media_bytes, image_url)
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
         print(f"[AI Vision] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
-        image_bytes = _download_media_bytes(image_url)
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="nutritionist",
+            stage="vision_extract",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload={"payload": payload, "has_image": True},
+            response_text=response_text,
+            usage=usage,
+        )
+        print(
+            f"[AI Vision] Response received in {elapsed_ms} ms "
+            f"(chars={len(response_text)})"
+        )
+    def _validate(parsed: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(parsed, dict):
+            raise ValueError("vision_invalid_object")
+        print(f"[AI Vision] Parsed keys: {sorted(parsed.keys())}")
+        return parsed
+
+    def _call_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL_3_1_FLASH,
             system_instruction=system_prompt,
         )
         response = model.generate_content(
-            [
-                {
-                    "mime_type": "image/jpeg",
-                    "data": image_bytes,
-                },
-                json.dumps({"current_profile": current_profile}, ensure_ascii=False),
-            ],
+            [{"mime_type": "image/jpeg", "data": image_bytes}, payload],
             generation_config={"response_mime_type": "application/json"},
         )
-        response_text = response.text or "{}"
+        raw = extract_json_from_model_text(response.text or "{}")
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        print(
-            f"[AI Vision] Response received in {elapsed_ms} ms "
-            f"(chars={len(response_text)})"
-        )
-        parsed = extract_json_from_model_text(response_text)
-        print(f"[AI Vision] Parsed keys: {sorted(parsed.keys())}")
+        _observe(payload, response.text or "{}", elapsed_ms, response)
+        return _validate(raw)
+
+    previous_error = ""
+    for attempt in range(1, MAX_MEMORY_RETRIES + 1):
+        payload = {
+            "current_profile": current_profile,
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "instruction": "Fix previous failure and return strict JSON with status/category/food_log_entry.",
+                }
+                if attempt > 1
+                else {}
+            ),
+        }
+        try:
+            result = await asyncio.to_thread(_call_multimodal, payload)
+            if attempt > 1:
+                log_agent_event(
+                    agent="nutritionist",
+                    stage="vision_retry_success",
+                    trace_id=trace_id,
+                    details={"attempt": attempt},
+                )
+            break
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            log_agent_event(
+                agent="nutritionist",
+                stage="vision_retry_failed",
+                status="warn",
+                trace_id=trace_id,
+                details={"attempt": attempt, "reason": previous_error[:200]},
+            )
+    else:
+        return {}
+
+    try:
         log_agent_event(
             agent="nutritionist",
             stage="vision_complete",
             trace_id=trace_id,
-            details={"parsed_keys": sorted(parsed.keys())},
+            details={"parsed_keys": sorted(result.keys())},
         )
-        return parsed
-
-    return await asyncio.to_thread(_call_model)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log_agent_event(agent="nutritionist", stage="vision_complete", status="warn", trace_id=trace_id, details={"reason": str(exc)[:200]})
+        return {}
 
 
 async def ai_transcribe_voice_note(
@@ -309,7 +424,7 @@ async def ai_transcribe_voice_note(
         "No markdown. No extra keys unless needed."
     )
 
-    def _call_model() -> dict[str, Any]:
+    def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
         started_at = time.perf_counter()
         print(f"[AI Audio] Calling Gemini model: {GEMINI_MODEL_3_1_FLASH}")
         audio_bytes = _download_media_bytes(media_url)
@@ -320,11 +435,26 @@ async def ai_transcribe_voice_note(
         response = model.generate_content(
             [
                 {"mime_type": media_content_type, "data": audio_bytes},
+                json.dumps(payload, ensure_ascii=False),
             ],
             generation_config={"response_mime_type": "application/json"},
         )
         response_text = response.text or "{}"
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="memory_clerk",
+            stage="voice_transcribe",
+            model=GEMINI_MODEL_3_1_FLASH,
+            latency_ms=elapsed_ms,
+            request_payload={"payload": payload, "media_content_type": media_content_type},
+            response_text=response_text,
+            usage=usage,
+        )
         print(
             f"[AI Audio] Response received in {elapsed_ms} ms "
             f"(chars={len(response_text)})"
@@ -344,7 +474,36 @@ async def ai_transcribe_voice_note(
         )
         return parsed
 
-    return await asyncio.to_thread(_call_model)
+    previous_error = ""
+    previous_output: dict[str, Any] = {}
+    for attempt in range(1, MAX_MEMORY_RETRIES + 1):
+        payload = {
+            "retry_context": (
+                {
+                    "attempt": attempt,
+                    "previous_failure_reason": previous_error,
+                    "previous_output": previous_output,
+                    "instruction": "Fix previous failure and return strict JSON with transcript.",
+                }
+                if attempt > 1
+                else {}
+            )
+        }
+        try:
+            result = await asyncio.to_thread(_call_model, payload)
+            if result == previous_output and attempt > 1:
+                raise ValueError("repeated_same_output")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            previous_error = str(exc)
+            log_agent_event(
+                agent="memory_clerk",
+                stage="voice_transcribe_retry_failed",
+                status="warn",
+                trace_id=trace_id,
+                details={"attempt": attempt, "reason": previous_error[:200]},
+            )
+    return {}
 
 
 def next_onboarding_prompt(profile: dict[str, Any]) -> str:

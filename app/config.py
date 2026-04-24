@@ -47,8 +47,8 @@ CHECKIN_MESSAGE: str = os.getenv(
 DIETITIAN_REVIEW_ENABLED: bool = (
     os.getenv("DIETITIAN_REVIEW_ENABLED", "true").lower() == "true"
 )
-DIETITIAN_REVIEW_HOUR: int = int(os.getenv("DIETITIAN_REVIEW_HOUR", "21"))
-DIETITIAN_REVIEW_MINUTE: int = int(os.getenv("DIETITIAN_REVIEW_MINUTE", "30"))
+DIETITIAN_REVIEW_HOUR: int = int(os.getenv("DIETITIAN_REVIEW_HOUR", "22"))
+DIETITIAN_REVIEW_MINUTE: int = int(os.getenv("DIETITIAN_REVIEW_MINUTE", "0"))
 SCHEDULER_TIMEZONE: str = os.getenv("SCHEDULER_TIMEZONE", "Asia/Kolkata")
 
 # Morning Workout Nudge settings.
@@ -61,4 +61,8 @@ TRIAL_DAILY_TURN_LIMIT: int = int(os.getenv("TRIAL_DAILY_TURN_LIMIT", "25"))
 TRIAL_DAILY_TURN_WARNING_THRESHOLD: int = int(
     os.getenv("TRIAL_DAILY_TURN_WARNING_THRESHOLD", "20")
 )
+
+# Observability controls (redaction policy can layer on top later).
+OBS_LOG_FULL_PAYLOAD: bool = os.getenv("OBS_LOG_FULL_PAYLOAD", "false").lower() == "true"
+OBS_PREVIEW_MAX_CHARS: int = int(os.getenv("OBS_PREVIEW_MAX_CHARS", "1200"))
 

@@ -5,6 +5,7 @@ from typing import Any
 
 from app.services.messages import (
     graduation_generic,
+    onboarding_completion_overview,
     graduation_with_targets,
     intake_basic_stats,
     intake_bulk_details,
@@ -212,3 +213,41 @@ def build_graduation_message(living_profile: dict[str, Any]) -> str:
     if cals > 0 and protein > 0:
         return graduation_with_targets(address, cals, protein)
     return graduation_generic(address)
+
+
+def build_onboarding_completion_message(living_profile: dict[str, Any]) -> str:
+    address = resolve_user_address(living_profile)
+    identity = living_profile.get("identity") or {}
+    physiology = living_profile.get("physiology") or {}
+    biometrics = physiology.get("biometrics") or {}
+    psychology = living_profile.get("psychology") or {}
+    lifestyle = living_profile.get("lifestyle") or {}
+
+    injuries = physiology.get("injuries") or []
+    injury_text = "none"
+    if isinstance(injuries, list) and injuries:
+        parts = []
+        for injury in injuries[:3]:
+            if isinstance(injury, dict):
+                part = str(injury.get("part") or "").strip()
+                severity = str(injury.get("severity") or "").strip()
+                if part:
+                    parts.append(f"{part} ({severity})" if severity else part)
+        if parts:
+            injury_text = ", ".join(parts)
+
+    equipment = lifestyle.get("available_equipment") or []
+    equipment_text = ", ".join([str(x).strip() for x in equipment if str(x).strip()]) or "not specified"
+
+    lines = [
+        f"Name: {str(identity.get('name') or 'not specified').strip()}",
+        f"Age: {int(_safe_float(biometrics.get('age')) or 0)}",
+        f"Height (cm): {int(_safe_float(biometrics.get('height')) or 0)}",
+        f"Current weight (kg): {int(_safe_float(biometrics.get('weight')) or 0)}",
+        f"Target weight (kg): {int(_safe_float(biometrics.get('target')) or 0)}",
+        f"Gender: {str(identity.get('gender') or 'not specified').strip()}",
+        f"Core why: {str(psychology.get('core_why') or 'not specified').strip()}",
+        f"Injuries: {injury_text}",
+        f"Equipment/setup: {equipment_text}",
+    ]
+    return onboarding_completion_overview(address, profile_lines=lines)

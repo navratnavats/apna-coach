@@ -1,69 +1,24 @@
 from __future__ import annotations
 
-import asyncio
-import json
+import time
 from typing import Any
-
-import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.intent_contract import (
+    ALLOWED_ROUTER_INTENTS,
+    classify_heuristic_intent,
+    normalize_router_result,
+)
 from app.services.agent_trace import log_agent_event
+from app.services.llm_contract_runner import run_json_contract
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
-ALLOWED_INTENTS = {
-    "burn_query",
-    "metric_explanation_query",
-    "workout_request",
-    "plan_create_request",
-    "plan_status_query",
-    "plan_edit_request",
-    "plan_change_signal",
-    "nutrition_log",
-    "activity_log",
-    "historical_query",
-    "profile_update",
-    "general_chat",
-}
+MAX_ROUTER_RETRIES = 3
 
 
 def _fallback_intent(user_message: str) -> str:
-    text = str(user_message or "").lower()
-    if any(
-        k in text
-        for k in (
-            "kya matlab",
-            "what does",
-            "mean",
-            "matlab",
-            "safe hai",
-            "is this safe",
-            "net deficit",
-            "deficit 1135",
-        )
-    ):
-        return "metric_explanation_query"
-    if any(k in text for k in ("what did i eat", "kya khaya", "on tuesday", "history", "kal kya khaya")):
-        return "historical_query"
-    if any(k in text for k in ("12 week", "8 week", "diet plan", "meal plan", "tomorrow plan")):
-        return "plan_create_request"
-    if any(k in text for k in ("edit plan", "modify plan", "adjust plan", "change plan")):
-        return "plan_edit_request"
-    if any(k in text for k in ("vacation", "travel", "trip", "missed today", "skip today")):
-        return "plan_change_signal"
-    if any(k in text for k in ("next week plan", "this week plan", "what next")):
-        return "plan_status_query"
-    if any(k in text for k in ("burn", "burnt", "deficit", "kcal", "calorie")):
-        return "burn_query"
-    if any(k in text for k in ("workout", "exercise", "training", "plan")):
-        return "workout_request"
-    if any(k in text for k in ("ate", "khaya", "meal", "dinner", "lunch", "breakfast")):
-        return "nutrition_log"
-    if any(
-        k in text
-        for k in ("ran", "run", "steps", "walked", "swim", "cycling", "gym", "badminton")
-    ):
-        return "activity_log"
-    return "general_chat"
+    return classify_heuristic_intent(user_message)
 
 
 async def classify_router_intent(
@@ -94,42 +49,64 @@ async def classify_router_intent(
         "You are Agent 2 Router for Apna Coach. Classify the message intent.\n"
         "Return ONLY JSON: {\"primary_intent\":\"...\",\"confidence\":\"high|medium|low\"}.\n"
         "Allowed primary_intent values exactly: "
-        "burn_query, metric_explanation_query, workout_request, plan_create_request, plan_status_query, plan_edit_request, plan_change_signal, nutrition_log, activity_log, historical_query, profile_update, general_chat.\n"
+        "burn_query, metric_explanation_query, food_recall_query, workout_request, plan_create_request, plan_status_query, plan_edit_request, plan_change_signal, nutrition_log, activity_log, historical_query, profile_update, general_chat.\n"
         "Rules:\n"
         "- burn_query: asking burned calories/deficit/intake metrics.\n"
         "- metric_explanation_query: asking meaning/interpretation/safety of a metric (e.g. net deficit value).\n"
+        "- food_recall_query: asks what user ate today or meal-wise today (breakfast/lunch/dinner).\n"
         "- workout_request: asks for workout plan/exercise prescription.\n"
         "- plan_create_request: asks for multi-day/week/month diet/workout plan.\n"
         "- plan_status_query: asks what current plan says for tomorrow/this week/next.\n"
         "- plan_edit_request: explicitly asks to edit or adjust existing plan.\n"
-        "- plan_change_signal: life event impacting plan (vacation, missed day, travel, injury flare).\n"
+        "- plan_change_signal: life event impacting plan where user implies/asks plan adjustment (vacation, missed day, travel, schedule disruption).\n"
         "- nutrition_log: user logs food intake.\n"
         "- activity_log: user logs physical activity done.\n"
         "- historical_query: asks what was eaten/done on past day/date.\n"
         "- profile_update: user updates age/height/gender/weight/equipment/etc.\n"
-        "- general_chat: everything else."
+        "- general_chat: everything else.\n"
+        "Negative examples:\n"
+        "- 'Aaj 2 roti khayi' is nutrition_log, not plan_create_request.\n"
+        "- 'Next week plan dikhao' is plan_status_query, not workout_request.\n"
+        "- 'Deficit 900 safe hai?' is metric_explanation_query, not burn_query.\n"
+        "- 'I forgot to mention: I have knee pain' is profile_update unless user asks to change plan.\n"
+        "Retry contract:\n"
+        "- If retry_context is provided, you MUST fix prior failure reason and avoid repeating the same mistake.\n"
+        "- Keep output concise and strictly schema-valid JSON."
     )
 
-    def _call_model() -> dict[str, Any]:
-        model = genai.GenerativeModel(
-            model_name=GEMINI_COACH_MODEL,
-            system_instruction=system_prompt,
+    def _observe(payload: dict[str, Any], response_text: str, elapsed_ms: int, response: object) -> None:
+        usage = extract_gemini_usage(response)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="router",
+            stage="classify_intent",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response_text,
+            usage=usage,
         )
-        response = model.generate_content(
-            user_message,
-            generation_config={"response_mime_type": "application/json"},
-        )
-        raw = json.loads((response.text or "{}").strip())
+    def _validate(raw: dict[str, Any]) -> dict[str, Any]:
         intent = str(raw.get("primary_intent") or "").strip()
-        if intent not in ALLOWED_INTENTS:
-            intent = _fallback_intent(user_message)
+        if intent not in ALLOWED_ROUTER_INTENTS:
+            raise ValueError(f"invalid_intent:{intent or 'empty'}")
         confidence = str(raw.get("confidence") or "low").strip().lower()
         if confidence not in {"high", "medium", "low"}:
-            confidence = "low"
-        return {"primary_intent": intent, "confidence": confidence}
+            raise ValueError(f"invalid_confidence:{confidence or 'empty'}")
+        return normalize_router_result({"primary_intent": intent, "confidence": confidence})
 
     try:
-        result = await asyncio.to_thread(_call_model)
+        result = await run_json_contract(
+            model_name=GEMINI_COACH_MODEL,
+            system_prompt=system_prompt,
+            payload={"user_message": user_message},
+            max_retries=MAX_ROUTER_RETRIES,
+            validator=_validate,
+            on_attempt_response=_observe,
+        )
         log_agent_event(
             agent="router",
             stage="complete",
@@ -138,13 +115,22 @@ async def classify_router_intent(
         )
         return result
     except Exception as exc:  # noqa: BLE001
-        intent = _fallback_intent(user_message)
-        result = {"primary_intent": intent, "confidence": "fallback"}
+        previous_error = str(exc)
         log_agent_event(
             agent="router",
-            stage="complete",
-            status="llm_failed_fallback",
+            stage="retry_failed",
+            status="warn",
             trace_id=trace_id,
-            details={"error": str(exc), **result},
+            details={"attempt": MAX_ROUTER_RETRIES, "reason": previous_error[:200]},
         )
-        return result
+
+    intent = _fallback_intent(user_message)
+    result = {"primary_intent": intent, "confidence": "fallback"}
+    log_agent_event(
+        agent="router",
+        stage="complete",
+        status="llm_failed_fallback",
+        trace_id=trace_id,
+        details={"error": previous_error or "retries_exhausted", **result},
+    )
+    return result
