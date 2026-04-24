@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -10,6 +11,7 @@ import google.generativeai as genai
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
 from app.services.agent_trace import log_agent_event
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 
 
@@ -145,6 +147,7 @@ async def run_medical_safety_officer(
     }
 
     def _call_model() -> str:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -152,6 +155,20 @@ async def run_medical_safety_officer(
         response = model.generate_content(
             json.dumps(model_input, ensure_ascii=False),
             generation_config={"response_mime_type": "text/plain"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="medical_safety_officer",
+            stage="review_workout_safety",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=model_input,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         return (response.text or "").strip()
 

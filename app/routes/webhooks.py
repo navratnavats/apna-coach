@@ -108,6 +108,7 @@ from app.services.temporal_mapper import build_temporal_metadata, infer_user_tim
 from app.services.temporal_intent_agent import parse_temporal_intent, should_invoke_temporal_agent
 from app.services.twilio_messaging import send_whatsapp_message
 from app.services.usage_quota import consume_daily_turn_quota
+from app.services.observability_async import enqueue_operation_metric
 
 router = APIRouter()
 RECENT_EVENT_TTL_SECONDS = 45
@@ -558,14 +559,19 @@ async def _run_phone_queue_worker(phone_number: str) -> None:
         source_event_ids = batch.get("source_event_ids") or []
         turn_id = str(batch.get("turn_id") or f"turn-{uuid4().hex[:16]}")
         trace_id = trace_ids[0] if trace_ids else f"{phone_number}-{int(time.time() * 1000)}"
-        await _process_and_send_twilio_reply(
-            phone_number,
-            combined_text,
-            media_items=media_items,
-            trace_id=trace_id,
-            turn_id=turn_id,
-            source_event_ids=source_event_ids,
-        )
+        try:
+            await _process_and_send_twilio_reply(
+                phone_number,
+                combined_text,
+                media_items=media_items,
+                trace_id=trace_id,
+                turn_id=turn_id,
+                source_event_ids=source_event_ids,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Phone Worker] Batch failed for {phone_number}: {exc}")
+            # Continue to next queued batch instead of killing worker task.
+            continue
 
 
 async def _process_and_send_twilio_reply(
@@ -579,6 +585,10 @@ async def _process_and_send_twilio_reply(
     request_started_at = time.perf_counter()
     reply_message = "Give me a second, optimizing your plan..."
     quota_warning_suffix = ""
+    llm_calls_estimate = 0
+    routed_intent = "general_chat"
+    routed_confidence = "low"
+    intent_source = "fallback_heuristic"
     phone_lock = _phone_locks.setdefault(phone_number, asyncio.Lock())
     media_items = media_items or []
     source_event_ids = source_event_ids or []
@@ -588,7 +598,7 @@ async def _process_and_send_twilio_reply(
     trace_id = turn_id
 
     async def _run_pipeline() -> None:
-        nonlocal reply_message, quota_warning_suffix
+        nonlocal reply_message, quota_warning_suffix, llm_calls_estimate
         log_agent_event(
             agent="front_desk",
             stage="pipeline_start",
@@ -672,8 +682,6 @@ async def _process_and_send_twilio_reply(
         effective_user_text = body
         voice_note_logged_this_turn = False
         source_hint = "text"
-        llm_calls_estimate = 0
-
         audio_media = [
             item
             for item in media_items
@@ -726,6 +734,7 @@ async def _process_and_send_twilio_reply(
             temporal_hint = await parse_temporal_intent(
                 user_text=effective_user_text,
                 timezone_name=inferred_tz,
+                trace_id=trace_id,
             )
         merged_profile, missing_before_turn, onboarding_session_expired = refresh_onboarding_session_state(
             merged_profile
@@ -736,7 +745,8 @@ async def _process_and_send_twilio_reply(
         if (not capability_query) and should_check_capability_intent_with_llm(effective_user_text):
             llm_calls_estimate += 1
             capability_query, capability_confidence = await classify_capability_discovery_intent(
-                effective_user_text
+                effective_user_text,
+                trace_id=trace_id,
             )
             log_agent_event(
                 agent="capability_agent",
@@ -1433,6 +1443,7 @@ async def _process_and_send_twilio_reply(
             psych_analysis = await analyze_psychology_signals(
                 user_message=effective_user_text,
                 living_profile=merged_profile,
+                trace_id=trace_id,
             )
             merged_profile = apply_psychology_update(merged_profile, psych_analysis)
 
@@ -1618,6 +1629,7 @@ async def _process_and_send_twilio_reply(
                         user_message=effective_user_text,
                         living_profile=fresh_profile,
                         plan_context=plan_context,
+                        trace_id=trace_id,
                     )
                     inferred_type, inferred_horizon = infer_plan_type_and_horizon(
                         effective_user_text
@@ -1693,10 +1705,12 @@ async def _process_and_send_twilio_reply(
         phone_number=phone_number,
     )
 
+    pipeline_status = "ok"
     try:
         async with phone_lock:
             await _run_pipeline()
     except Exception as exc:  # noqa: BLE001
+        pipeline_status = "failed"
         print(f"[Twilio Error] Brain pipeline failed: {exc}")
         log_agent_event(
             agent="front_desk",
@@ -1709,11 +1723,26 @@ async def _process_and_send_twilio_reply(
             pipeline_busy_retry()
         )
     finally:
-        reset_trace_context(trace_context_token)
-        done_event.set()
-        if not ping_task.done():
-            ping_task.cancel()
-        total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+        try:
+            reset_trace_context(trace_context_token)
+            done_event.set()
+            if not ping_task.done():
+                ping_task.cancel()
+            total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+            enqueue_operation_metric(
+                operation_id=turn_id or trace_id,
+                trace_id=trace_id,
+                turn_id=turn_id,
+                phone_number=phone_number,
+                total_latency_ms=total_elapsed_ms,
+                llm_calls_estimate=llm_calls_estimate,
+                final_status=pipeline_status,
+                routed_intent=routed_intent,
+                router_confidence=routed_confidence,
+                intent_source=intent_source,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Observability] Failed to enqueue operation metric: {exc}")
 
     if quota_warning_suffix and "trial limit" not in reply_message.lower():
         reply_message = f"{reply_message}{quota_warning_suffix}"

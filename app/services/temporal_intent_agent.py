@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 MAX_TEMPORAL_RETRIES = 3
 
@@ -41,6 +43,7 @@ async def parse_temporal_intent(
     *,
     user_text: str,
     timezone_name: str,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     if not GEMINI_API_KEY or not should_invoke_temporal_agent(user_text):
         return {}
@@ -89,6 +92,7 @@ async def parse_temporal_intent(
     allowed_conf = {"high", "medium", "low"}
 
     def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -96,6 +100,20 @@ async def parse_temporal_intent(
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="temporal_intent_agent",
+            stage="parse_temporal_intent",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         raw = json.loads((response.text or "{}").strip())
         if not isinstance(raw, dict):

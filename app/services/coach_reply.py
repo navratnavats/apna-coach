@@ -20,6 +20,7 @@ from app.services.messages import (
     coach_missing_equipment,
 )
 from app.services.medical_safety_officer import run_medical_safety_officer
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 from app.services.persona import resolve_user_address
 from app.services.intent_contract import (
     classify_heuristic_intent,
@@ -216,7 +217,11 @@ def _build_food_recall_reply(user_message: str, living_profile: dict[str, Any], 
     )
 
 
-async def _infer_training_environment_from_query(user_message: str) -> tuple[str, str]:
+async def _infer_training_environment_from_query(
+    user_message: str,
+    *,
+    trace_id: str | None = None,
+) -> tuple[str, str]:
     """
     LLM-based environment mapping from user's workout query.
     Returns (environment, confidence) where environment is one of:
@@ -234,6 +239,7 @@ async def _infer_training_environment_from_query(user_message: str) -> tuple[str
     )
 
     def _call_model(payload: dict[str, Any]) -> tuple[str, str]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -241,6 +247,20 @@ async def _infer_training_environment_from_query(user_message: str) -> tuple[str
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="coach",
+            stage="infer_training_environment",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         parsed = json.loads((response.text or "{}").strip())
         env = str(parsed.get("environment") or "unknown").strip().lower()
@@ -275,7 +295,10 @@ async def _infer_training_environment_from_query(user_message: str) -> tuple[str
 
 
 async def _generate_workout_program(
-    user_message: str, living_profile: dict[str, Any]
+    user_message: str,
+    living_profile: dict[str, Any],
+    *,
+    trace_id: str | None = None,
 ) -> str:
     """
     Specialist Workout Programmer agent (Hybrid Training).
@@ -296,6 +319,7 @@ async def _generate_workout_program(
     )
 
     def _call_model(payload: dict[str, Any]) -> str:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -303,6 +327,20 @@ async def _generate_workout_program(
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "text/plain"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="workout_programmer",
+            stage="generate_quick_hit",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         text = (response.text or "").strip()
         if not text:
@@ -579,7 +617,10 @@ async def generate_coach_reply(
         )
 
     if is_workout_request and not training_env:
-        inferred_env, inferred_conf = await _infer_training_environment_from_query(user_message)
+        inferred_env, inferred_conf = await _infer_training_environment_from_query(
+            user_message,
+            trace_id=trace_id,
+        )
         log_agent_event(
             agent="coach",
             stage="training_env_inferred",
@@ -612,7 +653,11 @@ async def generate_coach_reply(
     # Specialist handoff: for workout requests with equipment available,
     # route to Workout Programmer agent prompt.
     if is_workout_request:
-        workout_text = await _generate_workout_program(user_message, living_profile)
+        workout_text = await _generate_workout_program(
+            user_message,
+            living_profile,
+            trace_id=trace_id,
+        )
         if workout_text.strip():
             reviewed_workout = await run_medical_safety_officer(
                 workout_text,
@@ -714,6 +759,19 @@ async def generate_coach_reply(
         )
         reply_text = (response.text or "").strip()
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="coach",
+            stage="generate_reply",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=model_input,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
+        )
         print(f"[Coach] Response received in {elapsed_ms} ms (chars={len(reply_text)})")
         return reply_text
 

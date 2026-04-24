@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import google.generativeai as genai
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
 from app.config import GEMINI_API_KEY, GEMINI_COACH_MODEL
+from app.services.observability_async import enqueue_llm_call_event, extract_gemini_usage
 
 ALLOWED_TYPES = {"diet", "training", "hybrid"}
 ALLOWED_HORIZONS = {"daily", "weekly", "monthly"}
@@ -29,6 +31,7 @@ async def generate_structured_plan(
     user_message: str,
     living_profile: dict[str, Any],
     plan_context: dict[str, Any],
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     if not GEMINI_API_KEY:
         return _fallback(user_message)
@@ -56,6 +59,7 @@ async def generate_structured_plan(
     }
 
     def _call() -> dict[str, Any]:
+        started_at = time.perf_counter()
         model = genai.GenerativeModel(
             model_name=GEMINI_COACH_MODEL,
             system_instruction=system_prompt,
@@ -63,6 +67,20 @@ async def generate_structured_plan(
         response = model.generate_content(
             json.dumps(payload, ensure_ascii=False),
             generation_config={"response_mime_type": "application/json"},
+        )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        enqueue_llm_call_event(
+            operation_id=trace_id,
+            trace_id=trace_id,
+            turn_id=None,
+            phone_number=None,
+            agent="plan_agent",
+            stage="generate_structured_plan",
+            model=GEMINI_COACH_MODEL,
+            latency_ms=elapsed_ms,
+            request_payload=payload,
+            response_text=response.text or "",
+            usage=extract_gemini_usage(response),
         )
         raw = json.loads((response.text or "{}").strip())
         return raw if isinstance(raw, dict) else {}
