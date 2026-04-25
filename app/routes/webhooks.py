@@ -318,6 +318,62 @@ async def _humanize_with_context(
     )
 
 
+async def _wrap_plan_output_with_warmth(
+    *,
+    plan_text: str,
+    user_query: str,
+    living_profile: dict[str, Any],
+    trace_id: str | None = None,
+) -> str:
+    """
+    Sandwich approach: Warm preamble + static plan + warm closing.
+    
+    Preamble: Acknowledges what user asked for specifically.
+    Closing: Invites user to log first action from the plan.
+    Both kept under 2 lines each.
+    """
+    if not plan_text.strip():
+        return plan_text
+    
+    # Generate warm preamble
+    preamble_prompt = (
+        f"User asked: '{user_query}'\n\n"
+        "Write a warm 1-2 line preamble acknowledging what they asked for specifically. "
+        "Examples:\n"
+        "- If they asked 'aaj ka plan': 'Bhai, aaj Monday hai — recovery session. Dekho:'\n"
+        "- If they asked 'Week 2 dikhao': 'Week 2 ka plan ready hai, yeh raha:'\n"
+        "- If they asked 'make me a plan': 'Perfect, tumhare goal ke liye plan draft kar raha hoon:'\n\n"
+        "Keep it under 2 lines. Use natural Hinglish. End with colon or 'dekho'/'yeh raha'."
+    )
+    
+    preamble = await _humanize_with_context(
+        intent_text=preamble_prompt,
+        living_profile=living_profile,
+        last_user_message=user_query,
+        trace_id=trace_id,
+    )
+    
+    # Generate warm closing
+    closing_prompt = (
+        "Write a warm 1-2 line closing that invites the user to log their first action from the plan. "
+        "Examples:\n"
+        "- 'Breakfast ke baad batao kya khaya? Log kar dete hain.'\n"
+        "- 'Pehla workout complete karne ke baad mujhe batana!'\n"
+        "- 'Aaj se start karo, pehle meal ke baad log kar dena!'\n\n"
+        "Keep it under 2 lines. Make it actionable and engaging."
+    )
+    
+    closing = await _humanize_with_context(
+        intent_text=closing_prompt,
+        living_profile=living_profile,
+        last_user_message=user_query,
+        trace_id=trace_id,
+    )
+    
+    # Sandwich: preamble + plan + closing
+    return f"{preamble.strip()}\n\n{plan_text.strip()}\n\n{closing.strip()}"
+
+
 def _user_profile_cache_key(phone_number: str) -> str:
     return f"user_profile:{phone_number}"
 
@@ -2189,8 +2245,9 @@ async def _process_and_send_twilio_reply(
                         effective_user_text
                     )
                     requested_day = extract_requested_day_number(effective_user_text)
+                    plan_text = ""
                     if requested_day is not None and requested_day >= 1:
-                        reply_message = render_rolling_day_request(plan_payload, requested_day)
+                        plan_text = render_rolling_day_request(plan_payload, requested_day)
                     elif is_today_plan_request(effective_user_text):
                         tz_name = str(
                             ((fresh_profile.get("identity") or {}).get("timezone") or "Asia/Kolkata")
@@ -2203,16 +2260,28 @@ async def _process_and_send_twilio_reply(
                             day_name = "Mon"
                             today_iso = datetime.utcnow().strftime("%Y-%m-%d")
                         if is_today_diet_request(effective_user_text):
-                            reply_message = render_today_diet_vs_actual(
+                            plan_text = render_today_diet_vs_actual(
                                 plan_payload,
                                 fresh_profile,
                                 day_name=day_name,
                                 today_iso=today_iso,
                             )
                         else:
-                            reply_message = render_today_plan_view(plan_payload, day_name=day_name)
+                            plan_text = render_today_plan_view(plan_payload, day_name=day_name)
                     else:
-                        reply_message = render_plan_view(plan_payload, show_full=show_full)
+                        plan_text = render_plan_view(plan_payload, show_full=show_full)
+                    
+                    # Wrap plan output with warm preamble + closing
+                    if plan_text:
+                        llm_calls_estimate += 2  # preamble + closing
+                        reply_message = await _wrap_plan_output_with_warmth(
+                            plan_text=plan_text,
+                            user_query=effective_user_text,
+                            living_profile=fresh_profile,
+                            trace_id=trace_id,
+                        )
+                    else:
+                        reply_message = plan_text
             elif routed_intent == "plan_status_query":
                 reply_message = (
                     "Abhi active plan nahi mila. Bolo to main aapke goal ke hisaab se fresh plan draft kar du."
@@ -2684,6 +2753,18 @@ async def _process_and_send_twilio_reply(
                                     )
                                     if isinstance(latest_payload, dict) and latest_payload:
                                         reply_message = render_plan_view(latest_payload, show_full=True)
+            
+            # Wrap plan create/edit outputs with warmth (preamble + plan + closing)
+            if routed_intent in {"plan_create_request", "plan_edit_request"} and reply_message:
+                # Check if reply_message looks like a plan output (not a clarification question or error)
+                if len(reply_message) > 200 and not reply_message.startswith("Samajh"):
+                    llm_calls_estimate += 2  # preamble + closing
+                    reply_message = await _wrap_plan_output_with_warmth(
+                        plan_text=reply_message,
+                        user_query=effective_user_text,
+                        living_profile=fresh_profile,
+                        trace_id=trace_id,
+                    )
         # Store last_turn metadata for contextual routing in next turn (Fix 5)
         # and conversation history for context-aware coaching (Step 3)
         session_context_data = fresh_profile.get("session_context") or {}
