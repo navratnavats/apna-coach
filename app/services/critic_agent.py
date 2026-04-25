@@ -60,6 +60,7 @@ async def run_critic_agent(
         "- Use natural WhatsApp style, short lines, and light emoji usage.\n"
         "- Keep tone respectful and warm. Prefer 'aap' phrasing over rude/slangy 'tu/tera' unless user explicitly asked for that style.\n"
         "- Avoid sounding aggressive, sarcastic, or dismissive.\n"
+        "- PRESERVE conversational warmth markers like 'bhai', 'yaar', 'dekho', 'achha', 'tension mat le', 'solid hai', 'chal raha hai', 'bilkul', 'perfect', 'chinta mat karo'. Do NOT strip these in the name of brevity. A warm short response is better than a cold short response.\n"
         "- Output plain text only."
     )
 

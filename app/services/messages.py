@@ -64,6 +64,30 @@ def unknown_query_clarifier(address: str) -> str:
     )
 
 
+def calorie_terms_explainer(budget: int, tdee: int, deficit: int, months_to_goal: int = 3) -> str:
+    """
+    Explain the 3 confusing calorie metrics simply.
+    Users need to understand: What they burn vs what they should eat vs the gap.
+    """
+    return (
+        f"Calorie numbers ka simple breakdown:\n\n"
+        f"1️⃣ BODY BURN / TDEE ({tdee} kcal):\n"
+        f"Ye wo calories hain jo tumhara body NATURALLY har din burn karta hai — breathing, digestion, "
+        f"daily movement sab included. Isko 'maintenance calories' bhi kehte hain. Agar roz itna khao "
+        f"to weight same rahega.\n\n"
+        f"2️⃣ TARGET / DAILY BUDGET ({budget} kcal):\n"
+        f"Ye wo calories hain jo tumhe ROZ khana hai to reach your goal in ~{months_to_goal} months. "
+        f"Ye body burn se {tdee - budget} kcal kam hai — isi gap se fat loss hota hai. "
+        f"Ye tumhara REAL target hai — isse focus karo.\n\n"
+        f"3️⃣ DEFICIT ({deficit} kcal per day):\n"
+        f"Ye batata hai aaj tumne kitna fat burn kiya. Formula: "
+        f"Body burn - Aaj jo khaya = Deficit. Jitna bada deficit, utna fast fat loss (but sustainable "
+        f"range mein rehna chahiye).\n\n"
+        f"🎯 Simple rule: Har din {budget} kcal target pe raho, to {months_to_goal} months mein goal "
+        f"mil jayega consistently."
+    )
+
+
 def onboarding_missing_biometrics() -> str:
     return "Onboarding almost done. Bas ek final cheez: height, age, aur gender clear kijiye."
 

@@ -77,14 +77,21 @@ async def humanize_response(
         "2. Match their language exactly — Hinglish stays Hinglish, English stays English, Hindi stays Hindi\n"
         "3. Sound like a helpful human coach, never a form or system notification\n"
         "4. If this is onboarding context, explain WHY you need the info — not just WHAT\n"
-        "5. Max 4 short lines (not sentences — lines). No bullet lists unless absolutely necessary\n"
-        "6. No AI-speak: no 'Here is', 'As an AI', 'In conclusion', 'Important note'\n"
-        "7. Plain text only — no markdown, no formatting\n"
-        "8. If user asked something unrelated during onboarding, acknowledge their question warmly first, "
-        "then gently redirect to pending profile fields\n"
-        "9. Group related pending fields naturally — ask for identity fields together (name, age, gender), "
-        "biometric fields together (height, weight, target), and context fields together (injuries, equipment). "
-        "Never ask for more than one group at a time. Make it feel like one natural question, not a list.\n\n"
+        "5. No AI-speak: no 'Here is', 'As an AI', 'In conclusion', 'Important note'\n"
+        "6. Plain text only — no markdown, no formatting, no emojis unless the original had them\n"
+        "7. If user asked something unrelated during onboarding, acknowledge their question warmly first, "
+        "then gently redirect to pending profile fields\n\n"
+        "LENGTH & GROUPING (CRITICAL):\n"
+        "- WhatsApp messages should feel bite-sized, not overwhelming.\n"
+        "- If original message has MANY pending fields (5+), intelligently GROUP them:\n"
+        "  * Group 1: Identity (name, age, gender) — ask these together\n"
+        "  * Group 2: Biometrics (height, weight, target weight) — ask these together\n"
+        "  * Group 3: Context (injuries, equipment, training location) — ask these together\n"
+        "- Ask for ONE group at a time in your rewrite. Example: 'Pehle aapka naam, age aur gender bata do.'\n"
+        "- If original is a simple message (1-3 items), keep it conversational and concise.\n"
+        "- Target: Keep response under 500 characters when possible. If original has too much info, "
+        "prioritize the FIRST group and warmly mention 'baaki details baad mein puchhunga'.\n"
+        "- NEVER output bullet lists or numbered lists. Make it feel like natural speech.\n\n"
         "Output the humanized message only."
     )
     
@@ -123,6 +130,8 @@ async def humanize_response(
     
     try:
         result = await asyncio.to_thread(_call_model)
+        
+        # Only fallback if LLM returns empty (which should be rare with good prompts)
         if not result:
             log_agent_event(
                 agent="humanizer",
@@ -130,31 +139,11 @@ async def humanize_response(
                 status="fallback",
                 trace_id=trace_id,
             )
+            print(f"[Humanizer][FALLBACK] Empty LLM response, returning original")
             return original
         
-        # Relative length guard: if humanized result is >30% longer than original 
-        # and original was already short, reject it — original was fine
-        if len(result) > len(original) * 1.3 and len(original) < 400:
-            log_agent_event(
-                agent="humanizer",
-                stage="length_guard_relative",
-                status="fallback",
-                trace_id=trace_id,
-                details={"original_len": len(original), "result_len": len(result)},
-            )
-            return original
-        
-        # Absolute ceiling: WhatsApp messages over 500 chars feel like essays
-        if len(result) > 500:
-            log_agent_event(
-                agent="humanizer",
-                stage="length_guard_absolute",
-                status="fallback",
-                trace_id=trace_id,
-                details={"result_len": len(result)},
-            )
-            return original
-        
+        # Trust the LLM completely for length and formatting decisions
+        # No hard-coded guards - LLM handles grouping, length, and flow
         log_agent_event(
             agent="humanizer",
             stage="complete",

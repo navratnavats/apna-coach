@@ -16,6 +16,10 @@ from app.services.persona import resolve_user_address
 
 
 def _extract_injuries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Extract physical injuries (for movement safety) from profile.
+    Returns list of injury objects with part/severity/history.
+    """
     physiology = living_profile.get("physiology") or {}
     raw_injuries = physiology.get("injuries") or []
     if not isinstance(raw_injuries, list):
@@ -25,6 +29,23 @@ def _extract_injuries(living_profile: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(injury, dict):
             injuries.append(injury)
     return injuries
+
+
+def _extract_medical_conditions(living_profile: dict[str, Any]) -> list[str]:
+    """
+    Extract chronic medical conditions (diabetes, BP, PCOS, etc.) from profile.
+    Returns list of condition names as strings.
+    """
+    physiology = living_profile.get("physiology") or {}
+    medical_flags = physiology.get("medical_flags") or []
+    if not isinstance(medical_flags, list):
+        return []
+    conditions: list[str] = []
+    for flag in medical_flags:
+        condition = str(flag).strip().lower()
+        if condition:
+            conditions.append(condition)
+    return conditions
 
 
 def _has_mobility_risk(injuries: list[dict[str, Any]]) -> bool:
@@ -98,20 +119,29 @@ async def run_medical_safety_officer(
     """
     Agent 5 (Medical Safety Officer):
     Intercepts workout output and rewrites unsafe movements before user delivery.
+    Reviews both physical injuries AND chronic medical conditions.
     """
     injuries = _extract_injuries(living_profile)
+    medical_conditions = _extract_medical_conditions(living_profile)
     address = resolve_user_address(living_profile)
+    
+    has_safety_concerns = bool(injuries or medical_conditions)
+    
     log_agent_event(
         agent="medical_safety_officer",
         stage="start",
         trace_id=trace_id,
-        details={"source": source, "injury_count": len(injuries)},
+        details={
+            "source": source,
+            "injury_count": len(injuries),
+            "medical_condition_count": len(medical_conditions),
+        },
     )
-    if not injuries:
+    if not has_safety_concerns:
         log_agent_event(
             agent="medical_safety_officer",
             stage="bypass",
-            status="no_injuries",
+            status="no_safety_concerns",
             trace_id=trace_id,
         )
         return workout_text
@@ -130,19 +160,25 @@ async def run_medical_safety_officer(
     system_prompt = (
         "You are Medical_Safety_Officer for Apna Coach. Your role is purely analytical "
         "and protective.\n"
-        "You receive a draft workout and a user's injury profile.\n"
+        "You receive a draft workout, user's injury profile, and chronic medical conditions.\n"
         "Rules:\n"
-        "- If workout is safe for these injuries, return the original workout unchanged.\n"
+        "- Review for TWO types of safety concerns:\n"
+        "  * Physical injuries (knee, shoulder, back, etc.) — check movement safety\n"
+        "  * Chronic medical conditions (diabetes, hypertension, asthma, etc.) — check intensity/recovery safety\n"
+        "- If workout is safe for these conditions, return the original workout unchanged.\n"
         "- If any movement is risky, rewrite only the risky parts with low-impact alternatives.\n"
+        "- For medical conditions like diabetes: warn about blood sugar monitoring, hydration, and gradual intensity.\n"
+        "- For conditions like hypertension: avoid extremely high-intensity bursts, include recovery periods.\n"
         f"- Keep the same concise WhatsApp format and use address token '{address}'.\n"
-        "- If you swap something, explicitly mention why (injury protection).\n"
+        "- If you swap something, explicitly mention why (injury/medical protection).\n"
         "- Do not add markdown.\n"
         "- Output plain text only."
     )
 
     model_input = {
         "source": source,
-        "injuries": injuries,
+        "physical_injuries": injuries,
+        "chronic_medical_conditions": medical_conditions,
         "draft_workout": workout_text,
     }
 

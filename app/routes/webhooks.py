@@ -845,8 +845,14 @@ def _enqueue_into_batch(
     media_items: list[dict[str, str]],
     trace_id: str,
     event_id: str,
-) -> None:
+) -> bool:
+    """
+    Enqueue message into batch for processing.
+    Returns True if this is a NEW batch (first message), False if adding to existing batch.
+    """
     batch = _pending_batches.get(phone_number)
+    is_new_batch = batch is None
+    
     if not batch:
         batch = {
             "phone_number": phone_number,
@@ -872,6 +878,8 @@ def _enqueue_into_batch(
     if existing_task and not existing_task.done():
         existing_task.cancel()
     _batch_flush_tasks[phone_number] = asyncio.create_task(_flush_batch_after_window(phone_number))
+    
+    return is_new_batch
 
 
 async def _run_phone_queue_worker(phone_number: str) -> None:
@@ -1121,11 +1129,19 @@ async def _process_and_send_twilio_reply(
                 missing_fields=ONBOARDING_FIELDS,
             )
             merged_profile, current_profile_version = _persist_with_retry(merged_profile)
+            
+            # Clear all plan versions from plan_versions table to ensure full reset
+            try:
+                supabase.table("plan_versions").delete().eq("phone_number", phone_number).execute()
+                print(f"[ONBOARDING_RESTART] Cleared plan_versions for {phone_number}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ONBOARDING_RESTART] Failed to clear plan_versions: {exc}")
+            
             log_agent_event(
                 agent="intake_agent",
                 stage="onboarding_restarted",
                 trace_id=trace_id,
-                details={"scope": "full_profile_reset"},
+                details={"scope": "full_profile_reset", "plans_cleared": True},
             )
             address = resolve_user_address(merged_profile)
             static_text = onboarding_restart_done(address)
@@ -3079,7 +3095,7 @@ async def receive_twilio_webhook(
         )
     _recent_twilio_events[event_key] = now_ts
 
-    _enqueue_into_batch(
+    is_new_batch = _enqueue_into_batch(
         phone_number=phone_number,
         incoming_text=incoming_text,
         media_items=media_items,
@@ -3098,24 +3114,36 @@ async def receive_twilio_webhook(
             "num_media": NumMedia or "0",
             "message_sid": (MessageSid or "").strip(),
             "accepted": True,
+            "is_new_batch": is_new_batch,
         },
     )
 
-    has_audio = any(
-        str((m or {}).get("content_type") or "").lower().startswith("audio/")
-        for m in media_items
-    )
-    has_image = any(
-        str((m or {}).get("content_type") or "").lower().startswith("image/")
-        for m in media_items
-    )
-    ack_text = _contextual_ack_message(
-        has_audio=has_audio,
-        has_image=has_image,
-        user_text=incoming_text,
-    )
-    return Response(
-        content=_safe_twiml_message(ack_text),
-        media_type="application/xml",
-    )
+    # Only send ACK for first message in batch
+    # Subsequent messages in same 10s window get NO response (cleaner UX)
+    # WhatsApp will still show "delivered" checkmarks, so user knows message went through
+    if is_new_batch:
+        has_audio = any(
+            str((m or {}).get("content_type") or "").lower().startswith("audio/")
+            for m in media_items
+        )
+        has_image = any(
+            str((m or {}).get("content_type") or "").lower().startswith("image/")
+            for m in media_items
+        )
+        ack_text = _contextual_ack_message(
+            has_audio=has_audio,
+            has_image=has_image,
+            user_text=incoming_text,
+        )
+        return Response(
+            content=_safe_twiml_message(ack_text),
+            media_type="application/xml",
+        )
+    else:
+        # No response for subsequent messages in same batch
+        # Empty TwiML response - Twilio won't send any message back
+        return Response(
+            content="<Response></Response>",
+            media_type="application/xml",
+        )
 

@@ -43,6 +43,12 @@ async def classify_router_intent(
             trace_id=trace_id,
             details=result,
         )
+        print(
+            f"[TRACE][ROUTER][FALLBACK] trace_id={trace_id} "
+            f"intent={result.get('primary_intent')} "
+            f"confidence={result.get('confidence')} "
+            f"reason=no_api_key"
+        )
         return result
 
     # Check if last_turn context should be included (time-gated to 10 minutes)
@@ -144,6 +150,12 @@ async def classify_router_intent(
             trace_id=trace_id,
             details=result,
         )
+        print(
+            f"[TRACE][ROUTER] trace_id={trace_id} "
+            f"intent={result.get('primary_intent')} "
+            f"confidence={result.get('confidence')} "
+            f"message_preview={user_message[:80]}"
+        )
         return result
     except Exception as exc:  # noqa: BLE001
         previous_error = str(exc)
@@ -162,6 +174,10 @@ async def classify_router_intent(
                 status="warn",
                 trace_id=trace_id,
                 details={"error": previous_error[:200]},
+            )
+            print(
+                f"[TRACE][ROUTER][QUOTA_EXHAUSTED] trace_id={trace_id} "
+                f"confidence=quota_exhausted error={previous_error[:100]}"
             )
             # Return special marker for webhooks.py to detect and send holding message
             return {"primary_intent": "general_chat", "confidence": "quota_exhausted"}
@@ -182,5 +198,11 @@ async def classify_router_intent(
         status="llm_failed_fallback",
         trace_id=trace_id,
         details={"error": previous_error or "retries_exhausted", **result},
+    )
+    print(
+        f"[TRACE][ROUTER][FALLBACK] trace_id={trace_id} "
+        f"intent={result.get('primary_intent')} "
+        f"confidence={result.get('confidence')} "
+        f"reason=llm_failed"
     )
     return result

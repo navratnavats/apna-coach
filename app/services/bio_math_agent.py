@@ -81,6 +81,15 @@ def calculate_tdee_and_macros(
     deficit = 700 if weight_gap >= 12 else 500
     target_cals = max(1200.0, tdee - deficit)
 
+    # Calculate estimated timeline to goal (for user clarity)
+    # 1 kg fat = ~7700 kcal. With daily deficit, estimate weeks/months to goal.
+    # Formula: (weight_gap kg * 7700 kcal) / (deficit kcal/day) = days to goal
+    estimated_days_to_goal = 0
+    estimated_months_to_goal = 3  # Default fallback
+    if weight_gap > 0 and deficit > 0:
+        estimated_days_to_goal = int((weight_gap * 7700) / deficit)
+        estimated_months_to_goal = max(1, round(estimated_days_to_goal / 30))  # Convert to months
+
     protein_g = max(1.8 * target_weight, 0.0)
     protein_cals = protein_g * 4
 
@@ -97,6 +106,7 @@ def calculate_tdee_and_macros(
         "protein_g": _safe_int(round(protein_g)),
         "carbs_g": _safe_int(round(carbs_g)),
         "fat_g": _safe_int(round(fat_g)),
+        "estimated_months_to_goal": estimated_months_to_goal,
     }
 
 

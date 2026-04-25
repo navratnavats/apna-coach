@@ -543,11 +543,11 @@ async def generate_coach_reply(
             action = "Kal food quality tighten kar ya extra activity add kar."
 
         budget_status = "neeche" if versus_budget >= 0 else "upar"
+        # Focus on budget (target intake), not TDEE (total burn)
         explain_reply = (
-            f"Number: Budget gap {abs(versus_budget)} kcal {budget_status} (budget {budget}, intake {intake}).\n"
-            f"Meaning: Plan ke hisaab se aap target calories se {abs(versus_budget)} kcal {budget_status} hain. "
-            f"Safety context: net deficit {net_deficit} = ({tdee} + {active}) - {intake}.\n"
-            f"Action: {action}"
+            f"Aaj ka intake: {intake} kcal.\n"
+            f"Target: {budget} kcal (aap {abs(versus_budget)} kcal {budget_status} hain).\n"
+            f"Fat loss context: Aaj ka net deficit {net_deficit} kcal hai. {action}"
         )
         return await _finalize_with_critic(
             explain_reply,
@@ -559,11 +559,11 @@ async def generate_coach_reply(
 
     if is_burn_query:
         budget_status = "neeche" if versus_budget >= 0 else "upar"
+        # Focus on budget (target intake) and active burn, not TDEE
         burn_reply = (
-            f"Number: Budget gap {abs(versus_budget)} kcal {budget_status} "
-            f"(budget {budget}, intake {intake}).\n"
-            f"Meaning: Aaj active burn {active} kcal hai. Safety context: net deficit {net_deficit} "
-            f"= ({tdee} + {active}) - {intake}.\n"
+            f"Aaj ka intake: {intake} kcal.\n"
+            f"Target: {budget} kcal (aap {abs(versus_budget)} kcal {budget_status} hain).\n"
+            f"Active burn: {active} kcal. Total deficit: {net_deficit} kcal.\n"
             + coach_burn_recalc_hint()
         )
         return await _finalize_with_critic(
@@ -698,6 +698,17 @@ async def generate_coach_reply(
         )
         additional_rules.append(f"POLICY REASON: {policy_reason}")
 
+    # Extract user's language preference from profile
+    identity = living_profile.get("identity") or {}
+    language_mix = str(identity.get("language_mix") or "Hinglish").strip()
+    
+    # Map language_mix to specific instruction
+    language_instruction = {
+        "hinglish": "You speak in conversational Hinglish (Hindi-English mix). Use natural phrases like 'tension mat le', 'focus kar', 'dhyaan se'.",
+        "english": "You speak in clear, conversational English. Keep it warm and natural, like talking to a friend.",
+        "hindi": "आप संवादात्मक हिंदी में बात करते हैं। सरल और स्पष्ट भाषा का उपयोग करें।",
+    }.get(language_mix.lower(), "You speak in conversational Hinglish (Hindi-English mix). Use natural phrases like 'tension mat le', 'focus kar', 'dhyaan se'.")
+    
     # Add conversation history if available
     conversation_history = session_context.get("conversation_history") or []
     history_context = ""
@@ -719,8 +730,21 @@ async def generate_coach_reply(
     
     system_prompt = (
         "You are Apna Coach, an empathetic, firm, and knowledgeable fitness brother. "
-        "You speak in conversational Hinglish (or the user's preferred language). "
-        "Use natural phrases like 'tension mat le', 'focus kar', and 'dhyaan se' when appropriate. "
+        f"{language_instruction} "
+        "CRITICAL: Match the user's language EXACTLY. If their profile says Hinglish, respond in Hinglish. "
+        "If it says English, respond in English. If it says Hindi, respond in Hindi. "
+        "Do NOT switch languages mid-conversation unless the user explicitly asks. "
+        "\n"
+        "EMOTIONAL INTELLIGENCE:\n"
+        "- Before generating your response, consider what the user is REALLY asking beyond the literal words.\n"
+        "- Answer both the literal question AND the emotional subtext in one warm response.\n"
+        "- Examples:\n"
+        "  * Timeline question ('kitne din lagega', 'how long will it take') = asking for reassurance that goal is reachable\n"
+        "  * Calorie question ('kitna khana hai', 'am I eating right') = asking if they are doing okay\n"
+        "  * Workout question ('aaj kya karu', 'plan kya hai') = might be seeking motivation or structure\n"
+        "  * Progress question ('weight kam hua?', 'kuch progress hua?') = seeking validation and encouragement\n"
+        "- Acknowledge their concern, answer factually, and add warmth/motivation naturally.\n"
+        "\n"
         "Keep messages concise for WhatsApp. Always read the provided living_profile "
         "JSON context before answering. Reference their goals, respect their injuries, "
         "and ask one guiding question at the end to keep them engaged. Do not output "
@@ -737,10 +761,21 @@ async def generate_coach_reply(
         "estimated calories burnt and mention assumptions from "
         "session_context.activity_assumptions briefly. Tell user they can say "
         "'no rest/continuous' to recalculate.\n"
-        "If user asks how much calories burned/deficit today, answer using hard "
-        "numbers from logs.current_day.active_cals_burnt and logs.current_day.net_deficit "
-        "(do not guess). Prefer session_context.burn_facts when present and keep "
-        "those numeric values exact.\n"
+        "CALORIE COMMUNICATION RULES:\n"
+        "- Always reference 'calorie_budget' (target intake) as primary metric, NOT tdee.\n"
+        "- Example: 'Aaj 1200 kcal khaya, target 2000 kcal hai, 800 kcal aur khana hai.'\n"
+        "- For deficit context, use 'net_deficit' to explain fat loss progress.\n"
+        "- NEVER mention 'TDEE' or 'total daily energy expenditure' to user unless they explicitly ask "
+        "'what is tdee' or 'body burn kya hai' or similar confusion queries.\n"
+        "- If user asks calories burned/deficit, use logs.current_day.active_cals_burnt "
+        "and logs.current_day.net_deficit (exact numbers, no guessing).\n"
+        "- Prefer session_context.burn_facts when present for exact metric values.\n"
+        "- If user seems CONFUSED about calorie terms (asks 'budget matlab kya', 'deficit kaise calculate', "
+        "'kitna khana hai exactly', 'ye numbers samajh nahi aa rahe'), give them a SIMPLE explanation:\n"
+        "  * Body Burn/TDEE: Tumhara body naturally kitna burn karta hai daily (breathing, movement, digestion)\n"
+        "  * Target/Budget: Kitna khana hai daily to reach goal (body burn se kam to create fat loss)\n"
+        "  * Deficit: Aaj kitna fat burn hua (body burn - intake)\n"
+        "  Keep it conversational - don't list, explain like a coach would.\n"
         "If session_context.plan_context exists and routed intent is plan-related, "
         "use it as source of truth for continuity. For plan_create_request, provide a "
         "structured starter plan with Week 1 and tomorrow actions. For plan_status_query, "
