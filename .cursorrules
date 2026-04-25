@@ -1,6 +1,7 @@
-- Project: Apna Coach (AI Fitness Companion)
-- Goal: Solve the "static info" problem of GPT/YouTube with proactive conversation.
-- Vibe: Authentic "Bhai/Bro" Hinglish (Mirroring user tone).
-- Stack: FastAPI, Supabase, Meta WhatsApp API.
-- Mandatory: Every major response must be Text + Audio script.
-- Cost Rule: Use JSON pruning between agents. Reference @docs/ for all logic.
+- **Project:** Apna Coach (Conversational AI Fitness)
+- **Tone:** Chameleon-like. Mirror user's energy (Bhai/Bro/Brother/Professional/Hinglish/Hindi).
+- **Stack:** FastAPI (Python), Supabase (PostgreSQL), Meta WhatsApp API.
+- **Rule 1:** Every I/O operation must be `async def`.
+- **Rule 2:** Always refer to @docs/AGENT_ROSTER.md and @docs/RICH_USER_STATE.md.
+- **Rule 3:** No Walls of Text. Responses must be scannable and conversational.
+- **Rule 4:** Safety First. If a knee injury is present, the Medical Safety Officer must validate movements.

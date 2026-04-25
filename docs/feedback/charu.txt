@@ -1,0 +1,6 @@
+1. If i jsut copy paste the onboarding msg and use it to fill the details the onboarding usually either resets or goes in edit modes : i guess the reason is we are checking for th keywords like reset restart or edit during onboarding, and same message appears hence it does.
+    1.1 User intent is i already have this huge msg from APP,let me just copy paste it and add values in adjacent of asked field ( edge case is at bottom we have those edit restart et etc)
+    1.2 Solve: we need to somehow understand the intent of the message??
+
+2. Replies not the last one but main ones could be better
+    2.1 Sometimes it dont understand what i am trying to say

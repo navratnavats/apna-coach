@@ -1,0 +1,24 @@
+1. I looged the breakfast and it even did saved it, but when i asked in another message what did i have in breakfast today, it said, i dont log meal and all ( seems like some hard coded msg or somehing??)
+    1.1 What do we want: May be save it by time, in JSON breakfast this, lunch this dinner this, mroning snakc this, evening scak this,most importantly if user says even at 2pm that in breakfast i had this, we save it in breakfast column
+    1.2 What do we save, same thing we are saving in nutriotion log but move structed towards what i had in a day
+    1.3 In summary we can just write or have what i had in each part of day looking at JSON and save it in historical data for it to fetch
+    1.4 ofc this can grow but a cleanup task handler which can run every 2 weeks or 1 week deleting thoe historical data ( we nmay not need it till we have at 100 users but an idea , with low users we can check if the original thing we wanted is working or not).
+
+2. What i felt is, the intent to understand the msg not intent but the capa bility is wrong, we are too much dependent on deterministic way, why cant we just use LLM
+    2.1 the idea of product is to make human interct and feel a human is talking
+    2.2 i felt when i usually type something i would want answer exactly to it only.
+    2.3 May be May be we need to increase LLM usage for better understanding of things how does things can be handled.
+
+3. Latency
+    3.1 I felt latency is a very culprit here, many DB calls, or LLM calls
+    3.2 we need to check code, which thing it taking more time, can we cache it
+    3.3 for caching as well we need to take care of eveyrthting like invalidating, new cache ttl etc etc, hard e2e undertadning and stablizing things
+    3.4 goal would be to reduce the latency
+
+4. Same sort of static message 
+    4.1 Can we change those static message to different things??
+    4.2 Can agentic loop help us here??
+
+5. I need to tell what this app does,
+    5.1 we need to tell user this is what this app deos, make there wow from ohh this app can do this as well with wow this can can truly give quality responses and alligned on what said what this app can do
+    5.2 Idea is there are muktliple product with good feature that even ecists today but even people using them dont know ohh they can do this with this
