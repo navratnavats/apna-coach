@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from app.clients import gemini_client  # noqa: F401 - side-effect config
@@ -149,7 +150,16 @@ async def classify_onboarding_control_intent(
 ) -> dict[str, Any]:
     text = str(user_message or "").strip()
     lowered = text.lower()
+    started_at = time.perf_counter()
+    print(
+        "[TRACE][ONBOARDING_POLICY][CONTROL_START] "
+        f"pending_count={len(pending_fields)} text_preview={text[:120]}"
+    )
     if not text:
+        print(
+            "[TRACE][ONBOARDING_POLICY][CONTROL_END] "
+            "intent=none confidence=high reason=empty_input elapsed_ms=0"
+        )
         return {"intent": "none", "confidence": "high", "reason": "empty_input"}
 
     if GEMINI_API_KEY:
@@ -158,6 +168,12 @@ async def classify_onboarding_control_intent(
             pending_fields=pending_fields,
         )
         if llm_result is not None:
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            print(
+                "[TRACE][ONBOARDING_POLICY][CONTROL_END] "
+                f"intent={llm_result.get('intent')} confidence={llm_result.get('confidence')} "
+                f"reason={llm_result.get('reason')} source=llm elapsed_ms={elapsed_ms}"
+            )
             return llm_result
 
     # Deterministic fallback: only allow strict standalone control commands.
@@ -172,7 +188,19 @@ async def classify_onboarding_control_intent(
     normalized = " ".join(lowered.split())
     for intent, phrases in strict_commands.items():
         if normalized in phrases:
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            print(
+                "[TRACE][ONBOARDING_POLICY][CONTROL_END] "
+                f"intent={intent} confidence=fallback reason=strict_command_match "
+                f"source=fallback elapsed_ms={elapsed_ms}"
+            )
             return {"intent": intent, "confidence": "fallback", "reason": "strict_command_match"}
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    print(
+        "[TRACE][ONBOARDING_POLICY][CONTROL_END] "
+        "intent=none confidence=fallback reason=no_strict_command_match "
+        f"source=fallback elapsed_ms={elapsed_ms}"
+    )
     return {"intent": "none", "confidence": "fallback", "reason": "no_strict_command_match"}
 
 

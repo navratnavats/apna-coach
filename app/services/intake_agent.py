@@ -42,11 +42,14 @@ def _safe_float(value: Any) -> float:
 
 
 def get_missing_onboarding_fields(living_profile: dict[str, Any]) -> list[str]:
+    if bool(living_profile.get("onboarding_complete")):
+        return []
     identity = living_profile.get("identity") or {}
     physiology = living_profile.get("physiology") or {}
     biometrics = physiology.get("biometrics") or {}
     psychology = living_profile.get("psychology") or {}
     lifestyle = living_profile.get("lifestyle") or {}
+    onboarding = living_profile.get("onboarding") or {}
     name = str(identity.get("name") or "").strip()
 
     missing: list[str] = []
@@ -59,6 +62,10 @@ def get_missing_onboarding_fields(living_profile: dict[str, Any]) -> list[str]:
     core_why = str(psychology.get("core_why") or "").strip()
     injuries = physiology.get("injuries") or []
     equipment = lifestyle.get("available_equipment") or []
+    confirmed_fields_raw = onboarding.get("confirmed_fields") or []
+    confirmed_fields = {
+        str(x).strip().lower() for x in confirmed_fields_raw if str(x).strip()
+    }
 
     if not name:
         missing.append("name")
@@ -74,9 +81,11 @@ def get_missing_onboarding_fields(living_profile: dict[str, Any]) -> list[str]:
         missing.append("gender")
     if not core_why:
         missing.append("core_why")
-    if not isinstance(injuries, list) or len(injuries) == 0:
+    # Require explicit capture for injuries/equipment to avoid silent completion
+    # when model auto-fills defaults.
+    if "injuries" not in confirmed_fields:
         missing.append("injuries")
-    if not isinstance(equipment, list) or len(equipment) == 0:
+    if "equipment" not in confirmed_fields:
         missing.append("equipment")
 
     return missing

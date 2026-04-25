@@ -698,6 +698,25 @@ async def generate_coach_reply(
         )
         additional_rules.append(f"POLICY REASON: {policy_reason}")
 
+    # Add conversation history if available
+    conversation_history = session_context.get("conversation_history") or []
+    history_context = ""
+    if isinstance(conversation_history, list) and conversation_history:
+        history_lines = ["Recent conversation context (last 3 turns, time-gated to 10 minutes):"]
+        for i, turn_pair in enumerate(conversation_history, 1):
+            if isinstance(turn_pair, dict):
+                user_turn = turn_pair.get("user") or {}
+                assistant_turn = turn_pair.get("assistant") or {}
+                user_msg = str(user_turn.get("message") or "").strip()
+                user_intent = str(user_turn.get("intent") or "unknown").strip()
+                assistant_msg = str(assistant_turn.get("message") or "").strip()
+                if user_msg and assistant_msg:
+                    history_lines.append(f"Turn {i}:")
+                    history_lines.append(f"  User ({user_intent}): {user_msg}")
+                    history_lines.append(f"  Coach: {assistant_msg}")
+        if len(history_lines) > 1:
+            history_context = "\n".join(history_lines) + "\n\n"
+    
     system_prompt = (
         "You are Apna Coach, an empathetic, firm, and knowledgeable fitness brother. "
         "You speak in conversational Hinglish (or the user's preferred language). "
@@ -706,7 +725,8 @@ async def generate_coach_reply(
         "JSON context before answering. Reference their goals, respect their injuries, "
         "and ask one guiding question at the end to keep them engaged. Do not output "
         "markdown, just clean text.\n\n"
-        "If session_context.nutrition_logged_this_turn is true, acknowledge that food "
+        + history_context
+        + "If session_context.nutrition_logged_this_turn is true, acknowledge that food "
         "has been logged before giving coaching advice.\n"
         "If session_context.voice_note_logged_this_turn is true, briefly acknowledge "
         "that you processed their voice note before coaching response.\n"

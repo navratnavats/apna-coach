@@ -72,12 +72,17 @@ async def ai_memory_clerk(
     current_profile: dict[str, Any],
     source_hint: str = "text",
     trace_id: str | None = None,
+    conversation_history: str = "",
 ) -> dict[str, Any]:
     log_agent_event(
         agent="memory_clerk",
         stage="start",
         trace_id=trace_id,
-        details={"source_hint": source_hint, "message_chars": len(user_message or "")},
+        details={
+            "source_hint": source_hint,
+            "message_chars": len(user_message or ""),
+            "has_history": bool(conversation_history),
+        },
     )
     if not GEMINI_API_KEY:
         print("[AI] GEMINI_API_KEY missing; skipping extraction for this message.")
@@ -89,11 +94,15 @@ async def ai_memory_clerk(
         )
         return {}
 
+    history_context = ""
+    if conversation_history:
+        history_context = f"\n\n{conversation_history}\n\n"
+    
     system_prompt = (
         "You are the Memory Clerk for Apna Coach. Analyze the user message and "
         "extract Name, Weight, Injuries, or Goals. Return ONLY a JSON object "
         "representing the updates needed to the Living User Profile. Do not "
-        "hallucinate data.\n\n"
+        f"hallucinate data.{history_context}\n"
         "JSON rules:\n"
         "- Output must be valid JSON object only.\n"
         "- Use existing schema keys.\n"
@@ -159,7 +168,32 @@ async def ai_memory_clerk(
         "- If user says previous activity was not a performed event (e.g., routine only), "
         "return logs.activity_adjustment with mode='drop_last'.\n"
         "- Never remove existing logs. Return only additive updates.\n"
-        "- If information is missing, do not invent it and do not include that key."
+        "- If information is missing, do not invent it and do not include that key.\n\n"
+        "Onboarding field resolution rules (when user is in onboarding fast-lane):\n"
+        "- If user explicitly states training location (home/ghar/gym/park/road/outdoor) "
+        "WITHOUT listing specific equipment:\n"
+        "  - Set lifestyle.training_environment to the location ('home'/'gym'/'outdoor')\n"
+        "  - If location is gym, leave lifestyle.available_equipment as empty array - "
+        "downstream agents know what gym implies\n"
+        "  - If location is home/park/outdoor and user says 'no equipment'/'kuch nahi'/'bodyweight only', "
+        "set lifestyle.available_equipment to ['bodyweight']\n"
+        "  - If location is home/park/outdoor and user does NOT mention equipment at all, "
+        "set lifestyle.available_equipment to ['bodyweight'] as safe default\n"
+        "- If user explicitly confirms no injuries ('none'/'no injury'/'fit'/'100% fine'), "
+        "set physiology.injuries to empty array [] (not a fake object).\n"
+        "- Only mark equipment as resolved if user also provided or confirmed training_environment. "
+        "If user says 'bodyweight only' without any location context, mark both equipment AND "
+        "training_environment as resolved with inferred values (set training_environment to 'home' as default).\n"
+        "- Return onboarding_fields_resolved as array of field names that user explicitly answered "
+        "in this message (e.g., ['equipment','injuries','name']).\n"
+        "- Only include a field in onboarding_fields_resolved if user provided explicit value OR "
+        "explicit 'none' confirmation for that field.\n\n"
+        "Output format:\n"
+        "{\n"
+        '  "profile_updates": { ... profile changes ... },\n'
+        '  "onboarding_fields_resolved": ["field_name", ...]\n'
+        "}\n"
+        "If no onboarding fields were resolved, return empty array for onboarding_fields_resolved."
     )
 
     model_input = {
@@ -188,7 +222,21 @@ async def ai_memory_clerk(
     def _validate(parsed: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(parsed, dict):
             raise ValueError("memory_clerk_invalid_object")
-        logs = parsed.get("logs")
+        
+        # Handle new contract structure with profile_updates + onboarding_fields_resolved
+        # If profile_updates exists, use it; otherwise assume whole response is profile updates
+        if "profile_updates" in parsed:
+            profile_updates = parsed.get("profile_updates") or {}
+            onboarding_fields_resolved = parsed.get("onboarding_fields_resolved") or []
+            # Validate profile_updates structure
+            logs = profile_updates.get("logs")
+        else:
+            # Backward compatibility: assume whole parsed object is profile updates
+            profile_updates = parsed
+            onboarding_fields_resolved = []
+            logs = parsed.get("logs")
+        
+        # Normalize activity log if present
         if isinstance(logs, dict):
             raw_activity_log = logs.get("activity_log")
             normalized_activity: list[dict[str, Any]] = []
@@ -211,9 +259,17 @@ async def ai_memory_clerk(
                     normalized["safe_to_burn"] = bool(normalized.get("safe_to_burn"))
                     normalized_activity.append(normalized)
                 logs["activity_log"] = normalized_activity
-                parsed["logs"] = logs
-        print(f"[AI] Parsed update keys: {sorted(parsed.keys())}")
-        return parsed
+                profile_updates["logs"] = logs
+        
+        # Return in consistent format
+        result = {
+            "profile_updates": profile_updates,
+            "onboarding_fields_resolved": onboarding_fields_resolved,
+        }
+        print(f"[AI] Parsed update keys: {sorted(profile_updates.keys())}")
+        if onboarding_fields_resolved:
+            print(f"[AI] Onboarding fields resolved: {onboarding_fields_resolved}")
+        return result
 
     try:
         result = await run_json_contract(

@@ -20,6 +20,7 @@ from app.services.eod_compression import compress_today_for_archive
 from app.services.historical_archive import upsert_historical_day
 from app.services.morning_programmer import generate_morning_workout_nudge
 from app.services.persona import resolve_user_address
+from app.services.response_humanizer import humanize_response
 from app.services.twilio_messaging import send_whatsapp_message
 
 
@@ -51,11 +52,39 @@ async def run_proactive_checkin_job() -> None:
                 )
                 address = resolve_user_address(living_profile)
                 if "{address}" in CHECKIN_MESSAGE:
-                    message = CHECKIN_MESSAGE.format(address=address)
+                    static_text = CHECKIN_MESSAGE.format(address=address)
                 elif CHECKIN_MESSAGE.lower().startswith("bhai,"):
-                    message = f"{address},{CHECKIN_MESSAGE[5:]}"
+                    static_text = f"{address},{CHECKIN_MESSAGE[5:]}"
                 else:
-                    message = f"{address}, {CHECKIN_MESSAGE}"
+                    static_text = f"{address}, {CHECKIN_MESSAGE}"
+                
+                # Humanize proactive check-in message
+                # Include conversation history for context-aware proactive nudges
+                conversation_history_str = ""
+                session_context = living_profile.get("session_context") or {}
+                if isinstance(session_context, dict):
+                    history = session_context.get("conversation_history") or []
+                    if isinstance(history, list) and history:
+                        history_lines = []
+                        for turn_pair in history[-2:]:  # Last 2 turns for proactive context
+                            if isinstance(turn_pair, dict):
+                                user_turn = turn_pair.get("user") or {}
+                                assistant_turn = turn_pair.get("assistant") or {}
+                                user_msg = str(user_turn.get("message") or "").strip()
+                                assistant_msg = str(assistant_turn.get("message") or "").strip()
+                                if user_msg and assistant_msg:
+                                    history_lines.append(f"User: {user_msg[:100]}")
+                                    history_lines.append(f"Coach: {assistant_msg[:100]}")
+                        if history_lines:
+                            conversation_history_str = "Recent context:\n" + "\n".join(history_lines)
+                
+                message = await humanize_response(
+                    intent_text=static_text,
+                    living_profile=living_profile,
+                    last_user_message="",  # No user context for proactive messages
+                    trace_id=trace_id,
+                    conversation_history=conversation_history_str,
+                )
                 await send_whatsapp_message(phone_number, message)
             except Exception as exc:  # noqa: BLE001
                 print(f"[Scheduler] Failed check-in for {phone_number}: {exc}")

@@ -78,6 +78,7 @@ from app.services.onboarding_policy import (
     evaluate_onboarding_message,
 )
 from app.services.persona import resolve_user_address
+from app.services.response_humanizer import humanize_response
 from app.services.intent_router import classify_router_intent
 from app.services.intent_contract import (
     normalize_router_result,
@@ -191,9 +192,15 @@ def _filter_onboarding_updates(updates: dict[str, Any]) -> dict[str, Any]:
 
     lifestyle = updates.get("lifestyle")
     if isinstance(lifestyle, dict):
+        lifestyle_filtered: dict[str, Any] = {}
+        training_environment = lifestyle.get("training_environment")
+        if training_environment not in (None, ""):
+            lifestyle_filtered["training_environment"] = training_environment
         equipment = lifestyle.get("available_equipment")
         if isinstance(equipment, list):
-            filtered["lifestyle"] = {"available_equipment": equipment}
+            lifestyle_filtered["available_equipment"] = equipment
+        if lifestyle_filtered:
+            filtered["lifestyle"] = lifestyle_filtered
 
     return filtered
 
@@ -203,6 +210,112 @@ def _safe_twiml_message(text: str) -> str:
     return f"""<Response>
     <Message>{escaped}</Message>
 </Response>"""
+
+
+def _append_to_conversation_history(
+    session_context: dict[str, Any],
+    user_message: str,
+    intent: str,
+    assistant_message: str,
+    is_ack: bool = False,
+) -> dict[str, Any]:
+    """
+    Append a user+assistant turn to conversation_history.
+    Maintains last 3 turns, excludes ACKs and proactive nudges, time-gated to 10 minutes.
+    """
+    history = session_context.get("conversation_history") or []
+    if not isinstance(history, list):
+        history = []
+    
+    # Filter out old entries (> 10 minutes)
+    now = datetime.now(timezone.utc)
+    time_gate_seconds = 600  # 10 minutes
+    filtered_history = []
+    for turn_pair in history:
+        if isinstance(turn_pair, dict):
+            user_turn = turn_pair.get("user")
+            if isinstance(user_turn, dict):
+                ts_str = user_turn.get("timestamp")
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if (now - ts).total_seconds() <= time_gate_seconds:
+                            filtered_history.append(turn_pair)
+                    except (ValueError, TypeError):
+                        pass
+    
+    # Don't add ACK or proactive nudge turns to history
+    if not is_ack:
+        new_turn = {
+            "user": {
+                "message": user_message[:500],  # Truncate for storage
+                "intent": intent,
+                "timestamp": now.isoformat(),
+            },
+            "assistant": {
+                "message": assistant_message[:500],  # Truncate for storage
+                "timestamp": now.isoformat(),
+            },
+        }
+        filtered_history.append(new_turn)
+    
+    # Keep only last 3 turns
+    filtered_history = filtered_history[-3:]
+    
+    session_context["conversation_history"] = filtered_history
+    return session_context
+
+
+def _format_conversation_history_for_llm(session_context: dict[str, Any]) -> str:
+    """
+    Format conversation history into a readable string for LLM context.
+    Returns empty string if no valid history exists.
+    """
+    history = session_context.get("conversation_history") or []
+    if not isinstance(history, list) or not history:
+        return ""
+    
+    lines = ["Recent conversation context (last 3 turns, time-gated to 10 minutes):\n"]
+    for i, turn_pair in enumerate(history, 1):
+        if not isinstance(turn_pair, dict):
+            continue
+        user_turn = turn_pair.get("user") or {}
+        assistant_turn = turn_pair.get("assistant") or {}
+        
+        user_msg = str(user_turn.get("message") or "").strip()
+        user_intent = str(user_turn.get("intent") or "unknown").strip()
+        assistant_msg = str(assistant_turn.get("message") or "").strip()
+        
+        if user_msg and assistant_msg:
+            lines.append(f"Turn {i}:")
+            lines.append(f"  User ({user_intent}): {user_msg}")
+            lines.append(f"  Coach: {assistant_msg}")
+    
+    if len(lines) == 1:  # Only header, no valid turns
+        return ""
+    
+    return "\n".join(lines)
+
+
+async def _humanize_with_context(
+    intent_text: str,
+    living_profile: dict[str, Any],
+    last_user_message: str = "",
+    trace_id: str | None = None,
+) -> str:
+    """
+    Wrapper around humanize_response that automatically includes conversation history from profile.
+    """
+    conversation_history_str = _format_conversation_history_for_llm(
+        living_profile.get("session_context") or {}
+    )
+    return await humanize_response(
+        intent_text=intent_text,
+        living_profile=living_profile,
+        last_user_message=last_user_message,
+        trace_id=trace_id,
+        conversation_history=conversation_history_str,
+    )
 
 
 def _user_profile_cache_key(phone_number: str) -> str:
@@ -953,11 +1066,38 @@ async def _process_and_send_twilio_reply(
                 timezone_name=inferred_tz,
                 trace_id=trace_id,
             )
-        control_result = await classify_onboarding_control_intent(
-            user_message=effective_user_text,
-            pending_fields=missing_before_turn,
+        control_started_at = time.perf_counter()
+        print(
+            "[TRACE][ONBOARDING_CONTROL][START] "
+            f"trace_id={trace_id} pending_count={len(missing_before_turn)} "
+            f"text_preview={effective_user_text[:120]}"
         )
+        try:
+            control_result = await asyncio.wait_for(
+                classify_onboarding_control_intent(
+                    user_message=effective_user_text,
+                    pending_fields=missing_before_turn,
+                ),
+                timeout=20.0,
+            )
+        except asyncio.TimeoutError:
+            control_result = {
+                "intent": "none",
+                "confidence": "fallback",
+                "reason": "control_classifier_timeout",
+            }
+            print(
+                "[TRACE][ONBOARDING_CONTROL][TIMEOUT] "
+                f"trace_id={trace_id} timeout_sec=20"
+            )
         onboarding_control_intent = str(control_result.get("intent") or "none")
+        control_elapsed_ms = int((time.perf_counter() - control_started_at) * 1000)
+        print(
+            "[TRACE][ONBOARDING_CONTROL][END] "
+            f"trace_id={trace_id} intent={onboarding_control_intent} "
+            f"confidence={str(control_result.get('confidence') or 'low')} "
+            f"elapsed_ms={control_elapsed_ms}"
+        )
         log_agent_event(
             agent="policy_gate",
             stage="onboarding_control_classified",
@@ -969,6 +1109,10 @@ async def _process_and_send_twilio_reply(
             },
         )
         if onboarding_control_intent == "restart":
+            print(
+                "[TRACE][ONBOARDING_CONTROL][BRANCH] "
+                f"trace_id={trace_id} branch=restart"
+            )
             # Restart should work even after onboarding is complete; reset profile in DB.
             merged_profile = load_default_living_profile()
             merged_profile["onboarding_complete"] = False
@@ -984,7 +1128,13 @@ async def _process_and_send_twilio_reply(
                 details={"scope": "full_profile_reset"},
             )
             address = resolve_user_address(merged_profile)
-            reply_message = onboarding_restart_done(address)
+            static_text = onboarding_restart_done(address)
+            reply_message = await _humanize_with_context(
+                intent_text=static_text,
+                living_profile=merged_profile,
+                last_user_message=effective_user_text,
+                trace_id=trace_id,
+            )
             return
         capability_query = False
         if (
@@ -1006,7 +1156,13 @@ async def _process_and_send_twilio_reply(
         if capability_query:
             address = resolve_user_address(merged_profile)
             if onboarding_fast_lane:
-                reply_message = onboarding_capability_locked(address, missing_before_turn)
+                static_text = onboarding_capability_locked(address, missing_before_turn)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
             llm_calls_estimate += 1
             reply_message = await generate_capability_pitch(
@@ -1018,29 +1174,64 @@ async def _process_and_send_twilio_reply(
 
         if onboarding_fast_lane:
             if onboarding_control_intent == "help":
+                print(
+                    "[TRACE][ONBOARDING_CONTROL][BRANCH] "
+                    f"trace_id={trace_id} branch=help"
+                )
                 address = resolve_user_address(merged_profile)
-                reply_message = onboarding_help(address)
+                static_text = onboarding_help(address)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
             if onboarding_control_intent in {"status", "left"}:
+                print(
+                    "[TRACE][ONBOARDING_CONTROL][BRANCH] "
+                    f"trace_id={trace_id} branch=status_or_left"
+                )
                 address = resolve_user_address(merged_profile)
-                reply_message = onboarding_status(
+                static_text = onboarding_status(
                     address,
                     is_complete=False,
                     pending_fields=missing_before_turn,
                 )
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
             if onboarding_control_intent == "explain":
+                print(
+                    "[TRACE][ONBOARDING_CONTROL][BRANCH] "
+                    f"trace_id={trace_id} branch=explain"
+                )
                 address = resolve_user_address(merged_profile)
-                reply_message = onboarding_field_explanations(address, missing_before_turn)
+                static_text = onboarding_field_explanations(address, missing_before_turn)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
         policy_decision = "allow"
         policy_reason = "normal"
         policy_forced_mode = "push"
+        onboarding_matched_fields: list[str] = []
         routed_intent = "general_chat"
         routed_confidence = "low"
         intent_source = "fallback_heuristic"
         if onboarding_fast_lane:
             if onboarding_control_intent == "edit":
+                print(
+                    "[TRACE][ONBOARDING_CONTROL][BRANCH] "
+                    f"trace_id={trace_id} branch=edit"
+                )
                 merged_profile = touch_onboarding_session(
                     merged_profile,
                     missing_fields=ONBOARDING_FIELDS,
@@ -1052,7 +1243,13 @@ async def _process_and_send_twilio_reply(
                     trace_id=trace_id,
                 )
                 address = resolve_user_address(merged_profile)
-                reply_message = onboarding_edit_help(address)
+                static_text = onboarding_edit_help(address)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
             onboarding_policy = await evaluate_onboarding_message(
                 user_message=effective_user_text,
@@ -1060,7 +1257,11 @@ async def _process_and_send_twilio_reply(
                 has_media=bool(media_items),
             )
             matched_fields = onboarding_policy.get("matched_fields") or []
-            if isinstance(matched_fields, list) and matched_fields:
+            if isinstance(matched_fields, list):
+                onboarding_matched_fields = [
+                    str(x).strip().lower() for x in matched_fields if str(x).strip()
+                ]
+            if onboarding_matched_fields:
                 onboarding_control_intent = "none"
             onboarding_policy_decision = str(onboarding_policy.get("decision") or "allow")
             policy_reason = "onboarding_fast_lane"
@@ -1080,7 +1281,13 @@ async def _process_and_send_twilio_reply(
             )
             if onboarding_policy_decision != "allow":
                 address = resolve_user_address(merged_profile)
-                reply_message = onboarding_policy_redirect(address, missing_before_turn)
+                static_text = onboarding_policy_redirect(address, missing_before_turn)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
                 return
             log_agent_event(
                 agent="router",
@@ -1112,14 +1319,22 @@ async def _process_and_send_twilio_reply(
                 },
             )
             if policy_decision == "deny":
-                reply_message = str(policy_result.get("safe_response_hint") or "").strip() or (
-                    policy_out_of_scope()
+                static_text = str(policy_result.get("safe_response_hint") or "").strip() or policy_out_of_scope()
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
                 )
                 return
 
+            # Retrieve last_turn from profile for contextual routing (time-gated to 10 min)
+            last_turn_data = merged_profile.get("session_context", {}).get("last_turn") if isinstance(merged_profile.get("session_context"), dict) else None
+            
             llm_calls_estimate += 1
             router_result = await classify_router_intent(
                 effective_user_text,
+                last_turn=last_turn_data,
                 trace_id=trace_id,
             )
             normalized_router = normalize_router_result(router_result)
@@ -1130,6 +1345,17 @@ async def _process_and_send_twilio_reply(
                 if routed_confidence == "fallback"
                 else "router_primary"
             )
+            
+            # Handle quota exhaustion from intent router (429 error)
+            if routed_confidence == "quota_exhausted":
+                static_text = "Thoda busy hoon abhi, 30 seconds me dobara bhejo"
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=merged_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
+                return
             plan_fallback_intent = classify_plan_intent_fallback(effective_user_text)
             if plan_fallback_intent and should_allow_plan_fallback(routed_confidence):
                 routed_intent = plan_fallback_intent
@@ -1177,7 +1403,14 @@ async def _process_and_send_twilio_reply(
                 trace_id=trace_id,
             )
             intent_source = "unknown_handler"
-            reply_message = str(unknown_payload.get("clarify_question") or "").strip()
+            clarify_text = str(unknown_payload.get("clarify_question") or "").strip()
+            # Humanize in case it's the fallback static string
+            reply_message = await _humanize_with_context(
+                intent_text=clarify_text,
+                living_profile=merged_profile,
+                last_user_message=effective_user_text,
+                trace_id=trace_id,
+            )
             return
 
         historical_result: dict[str, Any] | None = None
@@ -1204,6 +1437,7 @@ async def _process_and_send_twilio_reply(
 
         memory_started_at = time.perf_counter()
         extracted_updates: dict[str, Any] = {}
+        onboarding_fields_resolved: list[str] = []
         should_extract_memory = should_run_memory_extraction(
             routed_intent=routed_intent,
             routed_confidence=routed_confidence,
@@ -1212,12 +1446,21 @@ async def _process_and_send_twilio_reply(
         )
         if should_extract_memory:
             llm_calls_estimate += 1
-            extracted_updates = await ai_memory_clerk(
+            # Format conversation history for context-aware extraction
+            conversation_history_str = _format_conversation_history_for_llm(
+                merged_profile.get("session_context") or {}
+            )
+            memory_clerk_result = await ai_memory_clerk(
                 effective_user_text,
                 merged_profile,
                 source_hint=source_hint,
                 trace_id=trace_id,
+                conversation_history=conversation_history_str,
             )
+            # Extract profile_updates and onboarding_fields_resolved from new contract
+            extracted_updates = memory_clerk_result.get("profile_updates") or {}
+            onboarding_fields_resolved = memory_clerk_result.get("onboarding_fields_resolved") or []
+            
             extracted_updates = sanitize_memory_updates(
                 extracted_updates,
                 trace_id=trace_id,
@@ -1448,8 +1691,12 @@ async def _process_and_send_twilio_reply(
             if rejected_non_fitness_images > 0:
                 has_non_media_text = bool((body or "").strip()) or bool(transcripts)
                 if (not has_non_media_text) and (rejected_non_fitness_images == len(image_media)):
-                    reply_message = (
-                        image_rejection()
+                    static_text = image_rejection()
+                    reply_message = await _humanize_with_context(
+                        intent_text=static_text,
+                        living_profile=merged_profile,
+                        last_user_message=effective_user_text,
+                        trace_id=trace_id,
                     )
                     return
             if nutrition_logged_this_turn:
@@ -1753,6 +2000,28 @@ async def _process_and_send_twilio_reply(
             )
             merged_profile = apply_psychology_update(merged_profile, psych_analysis)
 
+        # Explicit field confirmation tracking for onboarding reliability.
+        # Let LLM (via matched_fields + onboarding_fields_resolved) decide what got confirmed.
+        onboarding_state = merged_profile.get("onboarding") or {}
+        if not isinstance(onboarding_state, dict):
+            onboarding_state = {}
+        confirmed_fields_raw = onboarding_state.get("confirmed_fields") or []
+        confirmed_fields = {
+            str(x).strip().lower() for x in confirmed_fields_raw if str(x).strip()
+        }
+        for field in onboarding_matched_fields:
+            if field in ONBOARDING_FIELDS:
+                confirmed_fields.add(field)
+        # Add fields resolved by memory_clerk's new contract
+        for field in onboarding_fields_resolved:
+            field_normalized = str(field).strip().lower()
+            if field_normalized in ONBOARDING_FIELDS:
+                confirmed_fields.add(field_normalized)
+                print(f"[ONBOARDING][FIELD_RESOLVED] {field_normalized}")
+
+        onboarding_state["confirmed_fields"] = sorted(confirmed_fields)
+        merged_profile["onboarding"] = onboarding_state
+
         missing_after_merge = get_missing_onboarding_fields(merged_profile)
         merged_profile = touch_onboarding_session(
             merged_profile,
@@ -1800,9 +2069,21 @@ async def _process_and_send_twilio_reply(
             )
             if onboarding_session_expired:
                 address = resolve_user_address(fresh_profile)
-                reply_message = intake_resume_after_timeout(address, missing_onboarding_now)
+                static_text = intake_resume_after_timeout(address, missing_onboarding_now)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=fresh_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
             else:
-                reply_message = build_intake_prompt(fresh_profile, missing_onboarding_now)
+                static_text = build_intake_prompt(fresh_profile, missing_onboarding_now)
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=fresh_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
         elif (
             not onboarding_was_complete
             and onboarding_is_complete
@@ -1816,7 +2097,15 @@ async def _process_and_send_twilio_reply(
             onboarding_state["completion_overview_sent_at"] = datetime.now(timezone.utc).isoformat()
             fresh_profile["onboarding"] = onboarding_state
             fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
-            reply_message = build_onboarding_completion_message(fresh_profile)
+            static_text = build_onboarding_completion_message(fresh_profile)
+            # Split long completion message: profile summary + capabilities
+            # For now, humanize the full message (length guard will handle if too long)
+            reply_message = await _humanize_with_context(
+                intent_text=static_text,
+                living_profile=fresh_profile,
+                last_user_message=effective_user_text,
+                trace_id=trace_id,
+            )
             log_agent_event(
                 agent="intake_agent",
                 stage="graduated",
@@ -1836,14 +2125,24 @@ async def _process_and_send_twilio_reply(
         elif routed_intent == "plan_change_signal":
             plan_adjust_explicit = _explicit_plan_adjust_requested(effective_user_text)
             if injury_update_detected and not plan_adjust_explicit:
-                reply_message = injury_saved_plan_adjust_prompt()
+                static_text = injury_saved_plan_adjust_prompt()
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=fresh_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
+                )
             else:
                 fresh_profile = upsert_pending_change_request(
                     fresh_profile, effective_user_text
                 )
                 fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
-                reply_message = (
-                    "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
+                static_text = "Noted. Plan adjust kar du based on this update? Reply with Yes/No."
+                reply_message = await _humanize_with_context(
+                    intent_text=static_text,
+                    living_profile=fresh_profile,
+                    last_user_message=effective_user_text,
+                    trace_id=trace_id,
                 )
         else:
             latest_plan = fetch_latest_plan_version(phone_number)
@@ -1996,10 +2295,16 @@ async def _process_and_send_twilio_reply(
                             )
                         fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
                         if recommend_adjust:
-                            reply_message = (
+                            static_text = (
                                 f"Samajh gaya. {note or 'Reason noted.'} "
                                 f"Main next {window_days} days ke liye thoda realistic adjustment suggest kar sakta hu. "
                                 "Kar du? (Yes/No)"
+                            )
+                            reply_message = await _humanize_with_context(
+                                intent_text=static_text,
+                                living_profile=fresh_profile,
+                                last_user_message=effective_user_text,
+                                trace_id=trace_id,
                             )
                         else:
                             reply_message = (
@@ -2363,6 +2668,32 @@ async def _process_and_send_twilio_reply(
                                     )
                                     if isinstance(latest_payload, dict) and latest_payload:
                                         reply_message = render_plan_view(latest_payload, show_full=True)
+        # Store last_turn metadata for contextual routing in next turn (Fix 5)
+        # and conversation history for context-aware coaching (Step 3)
+        session_context_data = fresh_profile.get("session_context") or {}
+        if not isinstance(session_context_data, dict):
+            session_context_data = {}
+        session_context_data["last_turn"] = {
+            "user_message": effective_user_text[:500],  # Truncate for storage efficiency
+            "routed_intent": routed_intent,
+            "router_confidence": routed_confidence,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        # Append to conversation history (last 3 turns, time-gated, no ACKs)
+        is_ack_message = routed_confidence == "ack" or len(reply_message) < 50
+        session_context_data = _append_to_conversation_history(
+            session_context=session_context_data,
+            user_message=effective_user_text,
+            intent=routed_intent,
+            assistant_message=reply_message,
+            is_ack=is_ack_message,
+        )
+        
+        fresh_profile["session_context"] = session_context_data
+        # Persist updated profile with session context
+        fresh_profile, current_profile_version = _persist_with_retry(fresh_profile)
+        
         log_agent_event(
             agent="front_desk",
             stage="pipeline_complete",
@@ -2421,8 +2752,12 @@ async def _process_and_send_twilio_reply(
             trace_id=trace_id,
             details={"error": str(exc)},
         )
-        reply_message = (
-            pipeline_busy_retry()
+        static_text = pipeline_busy_retry()
+        reply_message = await _humanize_with_context(
+            intent_text=static_text,
+            living_profile=merged_profile,
+            last_user_message=effective_user_text,
+            trace_id=trace_id,
         )
     finally:
         try:

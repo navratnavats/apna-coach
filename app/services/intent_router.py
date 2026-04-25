@@ -22,7 +22,7 @@ def _fallback_intent(user_message: str) -> str:
 
 
 async def classify_router_intent(
-    user_message: str, *, trace_id: str | None = None
+    user_message: str, *, last_turn: dict[str, Any] | None = None, trace_id: str | None = None
 ) -> dict[str, Any]:
     """
     Agent 2 (Router): classify top-level intent before heavy agent path.
@@ -45,11 +45,42 @@ async def classify_router_intent(
         )
         return result
 
+    # Check if last_turn context should be included (time-gated to 10 minutes)
+    include_context = False
+    elapsed_seconds = None
+    if last_turn and isinstance(last_turn, dict):
+        timestamp_utc_str = last_turn.get("timestamp_utc")
+        if timestamp_utc_str:
+            try:
+                from datetime import datetime, timezone
+                last_turn_time = datetime.fromisoformat(timestamp_utc_str)
+                elapsed_seconds = (datetime.now(timezone.utc) - last_turn_time).total_seconds()
+                if elapsed_seconds <= 600:  # 10 minute window
+                    include_context = True
+            except Exception:
+                pass
+    
+    context_section = ""
+    if include_context and last_turn:
+        context_section = (
+            f"\nContext from previous turn ({int(elapsed_seconds or 0)}s ago):\n"
+            f"- User said: {last_turn.get('user_message', '')}\n"
+            f"- System routed as: {last_turn.get('routed_intent', 'unknown')}\n"
+            f"- Confidence: {last_turn.get('router_confidence', 'unknown')}\n\n"
+            "Use this context to resolve ambiguous current messages:\n"
+            "- If current message is acknowledgment ('theek hai', 'ok', 'haan', 'done', 'got it') after ANY intent, return SAME intent with confidence='continuation'\n"
+            "- If current message is continuation ('aur', 'aur kuch', 'iske baad', 'and then') of last intent, return SAME intent with confidence='continuation'\n"
+            "- If current message is completely unrelated to last_turn intent, ignore context and classify fresh\n"
+            "- If time gap > 10 minutes, ignore context entirely\n"
+        )
+    
     system_prompt = (
         "You are Agent 2 Router for Apna Coach. Classify the message intent.\n"
-        "Return ONLY JSON: {\"primary_intent\":\"...\",\"confidence\":\"high|medium|low\"}.\n"
+        "Return ONLY JSON: {\"primary_intent\":\"...\",\"confidence\":\"high|medium|low|continuation\"}.\n"
         "Allowed primary_intent values exactly: "
         "burn_query, metric_explanation_query, food_recall_query, workout_request, plan_create_request, plan_status_query, plan_edit_request, plan_change_signal, nutrition_log, activity_log, historical_query, profile_update, general_chat.\n"
+        "Allowed confidence values: high, medium, low, continuation.\n"
+        + context_section +
         "Rules:\n"
         "- burn_query: asking burned calories/deficit/intake metrics.\n"
         "- metric_explanation_query: asking meaning/interpretation/safety of a metric (e.g. net deficit value).\n"
@@ -116,6 +147,25 @@ async def classify_router_intent(
         return result
     except Exception as exc:  # noqa: BLE001
         previous_error = str(exc)
+        # Check if this is a 429 rate limit error specifically
+        error_lower = previous_error.lower()
+        is_429 = (
+            "429" in error_lower
+            or "rate" in error_lower and "limit" in error_lower
+            or "quota" in error_lower and "exceed" in error_lower
+            or "resource" in error_lower and "exhausted" in error_lower
+        )
+        if is_429:
+            log_agent_event(
+                agent="router",
+                stage="quota_exhausted",
+                status="warn",
+                trace_id=trace_id,
+                details={"error": previous_error[:200]},
+            )
+            # Return special marker for webhooks.py to detect and send holding message
+            return {"primary_intent": "general_chat", "confidence": "quota_exhausted"}
+        
         log_agent_event(
             agent="router",
             stage="retry_failed",

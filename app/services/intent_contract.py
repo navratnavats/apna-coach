@@ -24,6 +24,8 @@ ALLOWED_ROUTER_CONFIDENCE = {
     "low",
     "fallback",
     "fast_lane",
+    "continuation",
+    "quota_exhausted",
 }
 
 LOW_CONFIDENCE_VALUES = {"low", "fallback"}
